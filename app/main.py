@@ -43,6 +43,7 @@ AJUDA = """<b>Comandos</b>
 /estado – resumo do bot
 /ultimas – últimas publicações
 /exemplo – FORÇAR: mostra as 5 ofertas mais recentes da origem (ou /exemplo 10)
+/teste – igual, mas SEM link (para testar formato, imagem e permissões do canal)
 /pausar · /retomar – parar/continuar
 
 <b>Publicação</b>
@@ -275,15 +276,36 @@ class App:
             finally:
                 self.queue.task_done()
 
+    async def _preview_nolink(self, job: Job) -> None:
+        """Teste: a oferta tal como ficaria, mas sem a linha do link (não converte nada).
+        Publicável pelo botão; não fica no histórico nem conta para os limites."""
+        origem = job.origin or msg_link(job.chat_id, job.msg_id)
+        values = {
+            "titulo": job.offer.title,
+            "preco": job.offer.price,
+            "codigo": self.code or None,
+            "link": None,  # as linhas com campos vazios são omitidas no modelo
+        }
+        payload = {
+            "chat_id": job.chat_id, "msg_id": job.msg_id, "values": values,
+            "key": f"teste:{job.chat_id}:{job.msg_id}",
+            "web": job.web, "photo_url": job.photo_url, "origin": origem, "test": True,
+        }
+        await self.send_for_approval(payload, note="🧪 TESTE (sem link)\n\n")
+
     async def _fail(self, force: bool, text: str) -> str:
         """Em modo normal avisa o dono; em modo forçado devolve o texto para o resumo."""
         if not force:
             await self.notify(text)
         return text
 
-    async def process(self, job: Job, force: bool = False) -> str | None:
+    async def process(self, job: Job, force: bool = False, nolink: bool = False) -> str | None:
         """Converte e publica/envia para aprovação. Devolve o motivo se não avançou.
-        force=True: ignora o anti-duplicados e envia sempre para aprovação manual."""
+        force=True: ignora o anti-duplicados e envia sempre para aprovação manual.
+        nolink=True (teste): não converte o link; mostra a oferta sem a linha do link."""
+        if nolink:
+            await self._preview_nolink(job)
+            return None
         rules = links.load_rules(self.cfg.rules_path)
         rule = final = None
         for u in job.offer.urls:
@@ -417,7 +439,8 @@ class App:
             if not m:
                 await self.notify("⚠️ A mensagem original já não existe. Não publiquei.")
                 return False
-        await self._throttle()
+        if not payload.get("test"):
+            await self._throttle()
         premium = False if web else self.premium
         text, spec = render.render(self.template, payload["values"], premium=premium)
         ents = [MessageEntityCustomEmoji(o, l, d) for o, l, d in spec] or None
@@ -447,11 +470,12 @@ class App:
                     "Confirma que o bot é administrador do canal de destino com permissão para publicar."
                 )
                 return False
-        self.store.mark_posted(
-            payload["key"], payload.get("chat_id") or 0, payload.get("msg_id") or 0,
-            payload["values"].get("titulo") or "", payload["values"]["link"],
-        )
-        self.idle_alerted = False
+        if not payload.get("test"):  # os testes não entram no histórico nem nos limites
+            self.store.mark_posted(
+                payload["key"], payload.get("chat_id") or 0, payload.get("msg_id") or 0,
+                payload["values"].get("titulo") or "", payload["values"].get("link") or "",
+            )
+            self.idle_alerted = False
         log.info("Publicado %s", payload["key"])
         return True
 
@@ -495,7 +519,10 @@ class App:
 
     @staticmethod
     def main_buttons():
-        return [[Button.inline("🔄 Forçar: mostrar as 5 últimas", "f:5")]]
+        return [
+            [Button.inline("🔄 Forçar: mostrar as 5 últimas", "f:5")],
+            [Button.inline("🧪 Forçar sem link (teste)", "g:5")],
+        ]
 
     async def cmd_start(self, event, arg):
         await event.respond(AJUDA, parse_mode="html", buttons=self.main_buttons())
@@ -528,7 +555,12 @@ class App:
 
     cmd_forcar = cmd_exemplo
 
-    async def force_recent(self, n: int = 5) -> None:
+    async def cmd_teste(self, event, arg):
+        n = int(arg) if arg.isdigit() else 5
+        await event.respond("🧪 A obter as últimas ofertas (sem link)…")
+        await self.force_recent(n, nolink=True)
+
+    async def force_recent(self, n: int = 5, nolink: bool = False) -> None:
         """Mostra as n ofertas mais recentes da origem, ignorando 'só novas' e o
         anti-duplicados. Cada uma chega com Publicar/Rejeitar; nada é publicado sozinho."""
         n = max(1, min(int(n), 10))
@@ -586,18 +618,24 @@ class App:
             await say("Não encontrei ofertas recentes (com imagem e link) na origem." + extra)
             return
 
-        await say(f"🔄 A preparar <b>{len(jobs)}</b> oferta(s). Carrega em <b>Publicar</b> nas que quiseres.")
+        if nolink:
+            await say(
+                f"🧪 A preparar <b>{len(jobs)}</b> oferta(s) <b>sem link</b> (teste). "
+                "Se carregares em <b>Publicar</b>, vai para o canal de destino tal como está."
+            )
+        else:
+            await say(f"🔄 A preparar <b>{len(jobs)}</b> oferta(s). Carrega em <b>Publicar</b> nas que quiseres.")
         fails: list[str] = []
         for i, job in enumerate(jobs, 1):
             try:
-                err = await self.process(job, force=True)
+                err = await self.process(job, force=True, nolink=nolink)
             except Exception as e:
                 log.exception("Erro no modo forçado")
                 err = f"⚠️ Erro: {html.escape(str(e))}"
             if err:
                 fails.append(f"<b>{i}.</b> {err}")
         ok = len(jobs) - len(fails)
-        resumo = [f"✅ {ok} enviada(s) para aprovação."]
+        resumo = [f"✅ {ok} enviada(s) para aprovação" + (" (sem link, só teste)." if nolink else ".")]
         if skipped:
             resumo.append(f"{skipped} mensagem(ns) ignorada(s) (sem imagem ou sem link).")
         resumo += errs
@@ -935,6 +973,9 @@ class App:
             elif kind == "f":
                 await event.answer("A obter as últimas ofertas…")
                 await self.force_recent(int(val) if val.isdigit() else 5)
+            elif kind == "g":
+                await event.answer("A obter as últimas ofertas (sem link)…")
+                await self.force_recent(int(val) if val.isdigit() else 5, nolink=True)
             elif kind == "w":
                 names = [n for n in self.web_sources if n != val]
                 self.store.set("web_sources", names)

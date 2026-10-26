@@ -108,3 +108,27 @@ def test_normal_flow_still_skips_duplicates(tmp_path, monkeypatch):
     assert app.bot.sent == []  # duplicado: ignorado em silêncio
     asyncio.run(app.process(job, force=True))
     assert len(app.bot.sent) == 1 and "Já publicada" in app.bot.sent[0][1]
+
+
+def test_nolink_test_mode_posts_without_link_and_leaves_no_trace(tmp_path, monkeypatch):
+    app = make_app(tmp_path, monkeypatch, with_template=False)  # sem /linkmodelo feito
+    asyncio.run(app.force_recent(5, nolink=True))
+
+    files = [(c, kw) for k, c, kw in app.bot.sent if k == "file"]
+    assert len(files) == 5 and app.store.count_pending() == 5
+    for cap, kw in files:
+        assert cap.startswith("🧪 TESTE (sem link)")
+        assert "hacoo" not in cap and "📲" not in cap and "http" not in cap  # sem link
+        assert "COD14" in cap and "💰" in cap  # o resto do formato mantém-se
+        assert kw.get("buttons")
+    assert "sem link" in app.bot.sent[-1][1]
+
+    # carregar em Publicar: vai para o canal de destino, sem link, sem entrar no histórico
+    payload = app.store.pop_pending(1)
+    assert payload["test"] is True
+    app.bot.sent.clear()
+    assert asyncio.run(app.publish(payload)) is True
+    (kind, caption, _), = app.bot.sent
+    assert kind == "file" and "http" not in caption and "COD14" in caption
+    assert app.store.count_since(3600) == 0 and app.store.last_post_ts() is None
+    assert app.store.recent(10) == []
