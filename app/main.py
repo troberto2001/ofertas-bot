@@ -301,7 +301,7 @@ class App:
                 f"<b>Não publiquei.</b>\n{final}\nOrigem: {origem}"
             )
             return
-        link = links.build_link(rule, pid)
+        link = links.build_link(rule, pid, final)
         if not link:
             if not self.warned_template:
                 self.warned_template = True

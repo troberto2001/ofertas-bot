@@ -37,11 +37,14 @@ class Rule:
     template: str | None  # o TEU link, com {id} no lugar do ID do produto
 
 
+HACOO_ID_RE = r"/(?:detail|p)/(\d+)"          # a Hacoo usa /detail/ID e /p/ID
+_OLD_HACOO_ID_RE = r"/detail/(\d+)"           # versão anterior (migra-se sozinha)
+
 DEFAULT_RULES = [
     Rule(
         name="hacoo",
         host_re=r"(^|\.)hacoo\.",
-        id_re=r"/detail/(\d+)",
+        id_re=HACOO_ID_RE,
         template=None,
     )
 ]
@@ -53,7 +56,15 @@ def load_rules(path: Path) -> list[Rule]:
         save_rules(path, DEFAULT_RULES)
         return list(DEFAULT_RULES)
     data = json.loads(path.read_text("utf-8"))
-    return [Rule(**r) for r in data]
+    rules = [Rule(**r) for r in data]
+    migrated = False
+    for r in rules:
+        if r.name == "hacoo" and r.id_re == _OLD_HACOO_ID_RE:
+            r.id_re = HACOO_ID_RE
+            migrated = True
+    if migrated:
+        save_rules(path, rules)
+    return rules
 
 
 def save_rules(path: Path, rules: list[Rule]) -> None:
@@ -83,10 +94,17 @@ def canonical_url(rule: Rule, url: str) -> str | None:
     return f"{parts.scheme}://{parts.netloc}{parts.path[:path_end]}"
 
 
-def build_link(rule: Rule, product_id: str) -> str | None:
+def build_link(rule: Rule, product_id: str, source_url: str | None = None) -> str | None:
+    """O teu link para o produto. Se o link de origem usa /p/ID ou /detail/ID,
+    o teu link usa o mesmo tipo de página."""
     if not rule.template:
         return None
-    return rule.template.replace("{id}", product_id)
+    tpl = rule.template
+    if source_url:
+        m = re.search(r"/(detail|p)/\d+", urlsplit(source_url).path)
+        if m:
+            tpl = re.sub(r"/(?:detail|p)/\{id\}", "/" + m.group(1) + "/{id}", tpl, count=1)
+    return tpl.replace("{id}", product_id)
 
 
 def template_from_sample(rules: list[Rule], sample: str) -> tuple[Rule, str] | None:

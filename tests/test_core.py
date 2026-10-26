@@ -46,8 +46,37 @@ def test_url_trailing_punct():
 
 # ---------- links ----------
 def rules(template=None):
-    r = links.Rule("hacoo", r"(^|\.)hacoo\.", r"/detail/(\d+)", template)
+    r = links.Rule("hacoo", r"(^|\.)hacoo\.", links.HACOO_ID_RE, template)
     return [r]
+
+
+P_FORM = "https://www.hacoo.pl/p/11859290?f=p_aff.o_influxmcn.g_affiliate.m_agimenezmartin.c_aog.t_2026.v_1&ets=1792942152116"
+
+
+def test_p_form_links_and_path_prefix():
+    rs = rules()
+    r = links.match_rule(P_FORM, rs)
+    assert links.extract_id(r, P_FORM) == "11859290"
+    assert links.canonical_url(r, P_FORM) == "https://www.hacoo.pl/p/11859290"
+    # modelo guardado a partir de um link /detail/: para uma oferta /p/ usa /p/
+    r.template = "https://www.hacoo.pl/detail/{id}?f=MEU"
+    assert links.build_link(r, "11859290", P_FORM) == "https://www.hacoo.pl/p/11859290?f=MEU"
+    assert links.build_link(r, "39088013", THEIRS) == "https://www.hacoo.pl/detail/39088013?f=MEU"
+    assert links.build_link(r, "5") == "https://www.hacoo.pl/detail/5?f=MEU"  # sem origem: igual ao modelo
+    # modelo guardado a partir de um link /p/
+    rule, tpl = links.template_from_sample(rs, "https://www.hacoo.pl/p/1?f=MEU")
+    assert tpl == "https://www.hacoo.pl/p/{id}?f=MEU"
+
+
+def test_old_rules_file_migrates():
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "rules.json"
+        old = links.Rule("hacoo", r"(^|\.)hacoo\.", r"/detail/(\d+)", "https://www.hacoo.pl/detail/{id}?f=MEU")
+        links.save_rules(p, [old])
+        got = links.load_rules(p)[0]
+        assert got.id_re == links.HACOO_ID_RE and got.template.endswith("?f=MEU")
+        assert links.extract_id(got, P_FORM) == "11859290"
+        assert links.load_rules(p)[0].id_re == links.HACOO_ID_RE  # ficheiro foi regravado
 
 
 def test_match_extract_canonical():
