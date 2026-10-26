@@ -1,0 +1,17 @@
+name: ofertas-bot
+
+services:
+  bot:
+    build: .
+    container_name: ofertas-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
