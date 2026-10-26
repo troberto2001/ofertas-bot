@@ -52,6 +52,23 @@ def test_parse_html():
     assert posts[1].photo_url is None and parser.parse(posts[1].text, posts[1].urls) is None
 
 
+def test_recent_offers():
+    def post(i, with_photo):
+        return webfeed.WebPost(
+            "c", i, f"Produto {i}\n💰 {i}€\nhttps://x.com/p/{i}", [f"https://x.com/p/{i}"],
+            f"https://img/{i}.jpg" if with_photo else None,
+        )
+
+    posts = [post(i, i % 2 == 1) for i in range(1, 13)] + [webfeed.WebPost("c", 13, "bom dia", [], None)]
+    picked, skipped = webfeed.recent_offers(posts, 5, True)
+    assert [p.id for p, _ in picked] == [11, 9, 7, 5, 3]  # só com foto, mais novas primeiro
+    assert skipped == 6  # 13, 12, 10, 8, 6, 4
+    assert picked[0][1].title == "Produto 11" and picked[0][1].price == "11€"
+    picked2, _ = webfeed.recent_offers(posts, 3, False)
+    assert [p.id for p, _ in picked2] == [12, 11, 10]  # 13 não é oferta
+    assert webfeed.recent_offers([], 5, True) == ([], 0)
+
+
 def _client(status, body=""):
     return httpx.AsyncClient(
         transport=httpx.MockTransport(lambda req: httpx.Response(status, text=body))

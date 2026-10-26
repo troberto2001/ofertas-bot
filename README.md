@@ -37,6 +37,10 @@ O instalador instala o Docker (se faltar), pede as credenciais e arranca o bot. 
 
 Só publica ofertas **novas** a partir do momento em que adicionas o canal.
 
+### Forçar / ver exemplos (as 5 últimas)
+
+No chat do bot, o botão **🔄 Forçar: mostrar as 5 últimas** (aparece no `/start` e no `/estado`) ou o comando `/exemplo` (`/exemplo 10` para mais, máximo 10) vai buscar as ofertas mais recentes da origem, **mesmo as que já tinham passado** (ignora o "só novas" e o anti-duplicados), converte os links e envia cada uma ao teu chat com **Publicar / Rejeitar**. Nada é publicado sozinho, mesmo em `/auto`. As já publicadas nas últimas 24h vêm marcadas. No fim recebes um resumo, com o motivo das que não foi possível converter.
+
 Outros comandos: `/estado` `/ultimas` `/pausar` `/retomar` `/limite N` `/fontes` `/remover` `/modelo` `/recarregar`.
 
 ### Como converte o link

@@ -12,6 +12,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from .links import UA
+from .parser import Offer, parse
 
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
 _RESERVED = {"joinchat", "addlist", "addstickers", "proxy", "socks", "share", "login", "iv"}
@@ -64,6 +65,27 @@ def parse_html(channel: str, html: str) -> list[WebPost]:
                 photo = mm.group(1)
         posts.append(WebPost(channel, int(m.group(1)), text, urls, photo))
     return posts
+
+
+def recent_offers(
+    posts: list[WebPost], n: int, require_photo: bool
+) -> tuple[list[tuple[WebPost, Offer]], int]:
+    """As n ofertas mais recentes (mais novas primeiro) e quantas mensagens foram ignoradas
+    por não serem ofertas (sem link/título) ou por não terem imagem."""
+    picked: list[tuple[WebPost, Offer]] = []
+    skipped = 0
+    for p in sorted(posts, key=lambda x: x.id, reverse=True):
+        if len(picked) >= n:
+            break
+        if require_photo and not p.photo_url:
+            skipped += 1
+            continue
+        offer = parse(p.text, p.urls)
+        if not offer:
+            skipped += 1
+            continue
+        picked.append((p, offer))
+    return picked, skipped
 
 
 async def fetch(http: httpx.AsyncClient, channel: str) -> list[WebPost]:

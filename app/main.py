@@ -42,6 +42,7 @@ AJUDA = """<b>Comandos</b>
 <b>Estado</b>
 /estado – resumo do bot
 /ultimas – últimas publicações
+/exemplo – FORÇAR: mostra as 5 ofertas mais recentes da origem (ou /exemplo 10)
 /pausar · /retomar – parar/continuar
 
 <b>Publicação</b>
@@ -274,7 +275,15 @@ class App:
             finally:
                 self.queue.task_done()
 
-    async def process(self, job: Job) -> None:
+    async def _fail(self, force: bool, text: str) -> str:
+        """Em modo normal avisa o dono; em modo forçado devolve o texto para o resumo."""
+        if not force:
+            await self.notify(text)
+        return text
+
+    async def process(self, job: Job, force: bool = False) -> str | None:
+        """Converte e publica/envia para aprovação. Devolve o motivo se não avançou.
+        force=True: ignora o anti-duplicados e envia sempre para aprovação manual."""
         rules = links.load_rules(self.cfg.rules_path)
         rule = final = None
         for u in job.offer.urls:
@@ -289,33 +298,38 @@ class App:
                 break
         origem = job.origin or msg_link(job.chat_id, job.msg_id)
         if not rule:
-            await self.notify(
+            return await self._fail(
+                force,
                 "⚠️ Loja não suportada ou link que não consegui seguir. <b>Não publiquei.</b>\n"
-                f"Links: {' '.join(job.offer.urls)}\nOrigem: {origem}"
+                f"Links: {html.escape(' '.join(job.offer.urls))}\nOrigem: {origem}",
             )
-            return
         pid = links.extract_id(rule, final)
         if not pid:
-            await self.notify(
+            return await self._fail(
+                force,
                 f"⚠️ O formato do link da loja <b>{rule.name}</b> mudou (não encontro o ID do produto). "
-                f"<b>Não publiquei.</b>\n{final}\nOrigem: {origem}"
+                f"<b>Não publiquei.</b>\n{html.escape(final)}\nOrigem: {origem}",
             )
-            return
         link = links.build_link(rule, pid, final)
         if not link:
-            if not self.warned_template:
+            msg = (
+                "⚠️ Ainda não tenho o teu link de afiliado da loja "
+                f"<b>{rule.name}</b>. Gera um link de um produto na tua conta e envia:\n"
+                "<code>/linkmodelo SEU_LINK</code>\nAté lá não publico nada."
+            )
+            if not force and not self.warned_template:
                 self.warned_template = True
-                await self.notify(
-                    "⚠️ Ainda não tenho o teu link de afiliado da loja "
-                    f"<b>{rule.name}</b>. Gera um link de um produto na tua conta e envia:\n"
-                    "<code>/linkmodelo SEU_LINK</code>\nAté lá não publico nada."
-                )
-            return
+                await self.notify(msg)
+            return msg
 
         key = f"{rule.name}:{pid}"
-        if self.store.was_posted(key, self.cfg.dedup_hours) or self.store.has_pending_key(key):
+        note = ""
+        if force:
+            if self.store.was_posted(key, self.cfg.dedup_hours):
+                note = f"⚠️ Já publicada nas últimas {self.cfg.dedup_hours}h\n\n"
+        elif self.store.was_posted(key, self.cfg.dedup_hours) or self.store.has_pending_key(key):
             log.info("Duplicado ignorado: %s", key)
-            return
+            return None
 
         values = {
             "titulo": job.offer.title,
@@ -327,10 +341,13 @@ class App:
             "chat_id": job.chat_id, "msg_id": job.msg_id, "values": values, "key": key,
             "web": job.web, "photo_url": job.photo_url, "origin": origem,
         }
-        if self.mode == "auto":
+        if force:
+            await self.send_for_approval(payload, note=note)
+        elif self.mode == "auto":
             await self.publish(payload)
         else:
             await self.send_for_approval(payload)
+        return None
 
     # ---------- imagens ----------
     async def _download(self, url: str) -> io.BytesIO | None:
@@ -345,10 +362,10 @@ class App:
         return f
 
     # ---------- aprovação manual ----------
-    async def send_for_approval(self, payload: dict) -> None:
+    async def send_for_approval(self, payload: dict, note: str = "") -> None:
         pid = self.store.add_pending(payload["key"], payload)
         text, _ = render.render(self.template, payload["values"], premium=False)
-        text = render.to_plain(text)
+        text = note + render.to_plain(text)
         buttons = [[Button.inline("✅ Publicar", f"ok:{pid}"), Button.inline("❌ Rejeitar", f"no:{pid}")]]
         try:
             if payload.get("web"):
@@ -476,8 +493,12 @@ class App:
             log.exception("Erro num comando")
             await event.respond(f"⚠️ Erro: {e}")
 
+    @staticmethod
+    def main_buttons():
+        return [[Button.inline("🔄 Forçar: mostrar as 5 últimas", "f:5")]]
+
     async def cmd_start(self, event, arg):
-        await event.respond(AJUDA, parse_mode="html")
+        await event.respond(AJUDA, parse_mode="html", buttons=self.main_buttons())
 
     cmd_ajuda = cmd_start
 
@@ -498,7 +519,91 @@ class App:
         ]
         if sem_modelo:
             lines.append(f"⚠️ Falta o link modelo de: {', '.join(sem_modelo)} (/linkmodelo)")
-        await event.respond("\n".join(lines), parse_mode="html")
+        await event.respond("\n".join(lines), parse_mode="html", buttons=self.main_buttons())
+
+    async def cmd_exemplo(self, event, arg):
+        n = int(arg) if arg.isdigit() else 5
+        await event.respond("🔄 A obter as últimas ofertas…")
+        await self.force_recent(n)
+
+    cmd_forcar = cmd_exemplo
+
+    async def force_recent(self, n: int = 5) -> None:
+        """Mostra as n ofertas mais recentes da origem, ignorando 'só novas' e o
+        anti-duplicados. Cada uma chega com Publicar/Rejeitar; nada é publicado sozinho."""
+        n = max(1, min(int(n), 10))
+
+        async def say(text: str, **kw) -> None:
+            await self.bot.send_message(self.owner, text, parse_mode="html", link_preview=False, **kw)
+
+        jobs: list[Job] = []
+        skipped = 0
+        errs: list[str] = []
+        if self.web:
+            names = self.web_sources
+            if not names:
+                await say("Sem fontes. Usa /adicionar t.me/nomedocanal")
+                return
+            for name in names:
+                try:
+                    posts = await webfeed.fetch(self.http, name)
+                except Exception as e:
+                    errs.append(f"{html.escape(name)}: {html.escape(str(e))}")
+                    continue
+                picked, sk = webfeed.recent_offers(posts, n, self.cfg.require_photo)
+                skipped += sk
+                for p, offer in reversed(picked):  # as mais antigas primeiro; a mais nova chega por último
+                    jobs.append(Job(0, p.id, offer, photo_url=p.photo_url, web=True, origin=f"https://t.me/{name}/{p.id}"))
+        else:
+            srcs = [s for s in self.store.list_sources() if s.active]
+            if not srcs:
+                await say("Sem fontes. Usa /escolher ou /adicionar LINK.")
+                return
+            for s in srcs:
+                try:
+                    msgs = await self.client.get_messages(s.chat_id, limit=80)  # da mais nova para a mais antiga
+                except Exception as e:
+                    errs.append(f"{html.escape(s.title or str(s.chat_id))}: {html.escape(str(e))}")
+                    continue
+                found: list[Job] = []
+                for m in msgs:
+                    if len(found) >= n:
+                        break
+                    if s.topic_id and topic_of(m) != s.topic_id:
+                        continue
+                    if self.cfg.require_photo and not m.photo:
+                        skipped += 1
+                        continue
+                    offer = parse(m.raw_text or "", collect_urls(m))
+                    if not offer:
+                        skipped += 1
+                        continue
+                    found.append(Job(s.chat_id, m.id, offer))
+                jobs.extend(reversed(found))
+
+        if not jobs:
+            extra = ("\n" + "\n".join(errs)) if errs else ""
+            await say("Não encontrei ofertas recentes (com imagem e link) na origem." + extra)
+            return
+
+        await say(f"🔄 A preparar <b>{len(jobs)}</b> oferta(s). Carrega em <b>Publicar</b> nas que quiseres.")
+        fails: list[str] = []
+        for i, job in enumerate(jobs, 1):
+            try:
+                err = await self.process(job, force=True)
+            except Exception as e:
+                log.exception("Erro no modo forçado")
+                err = f"⚠️ Erro: {html.escape(str(e))}"
+            if err:
+                fails.append(f"<b>{i}.</b> {err}")
+        ok = len(jobs) - len(fails)
+        resumo = [f"✅ {ok} enviada(s) para aprovação."]
+        if skipped:
+            resumo.append(f"{skipped} mensagem(ns) ignorada(s) (sem imagem ou sem link).")
+        resumo += errs
+        if fails:
+            resumo.append("\n<b>Não consegui converter:</b>\n" + "\n\n".join(fails))
+        await say("\n".join(resumo), buttons=self.main_buttons())
 
     async def cmd_pausar(self, event, arg):
         self.store.set("paused", True)
@@ -827,6 +932,9 @@ class App:
                 await event.answer("A publicar…")
                 ok = await self.publish(payload)
                 await self._mark(event, "✅ Publicada" if ok else "⚠️ Falhou a publicação")
+            elif kind == "f":
+                await event.answer("A obter as últimas ofertas…")
+                await self.force_recent(int(val) if val.isdigit() else 5)
             elif kind == "w":
                 names = [n for n in self.web_sources if n != val]
                 self.store.set("web_sources", names)

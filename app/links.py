@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
@@ -53,8 +53,9 @@ DEFAULT_RULES = [
 # ---------- regras (ficheiro rules.json) ----------
 def load_rules(path: Path) -> list[Rule]:
     if not path.exists():
-        save_rules(path, DEFAULT_RULES)
-        return list(DEFAULT_RULES)
+        fresh = [replace(r) for r in DEFAULT_RULES]  # cópias: nunca partilhar objetos mutáveis
+        save_rules(path, fresh)
+        return fresh
     data = json.loads(path.read_text("utf-8"))
     rules = [Rule(**r) for r in data]
     migrated = False
