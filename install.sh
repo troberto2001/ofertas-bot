@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Instalação de um comando: bash install.sh
-# Instala o Docker (se faltar), pede as credenciais, faz o login do Telegram e arranca o bot.
-# Variáveis opcionais (modo sem perguntas): API_ID API_HASH BOT_TOKEN DEFAULT_CODE INSTALL_DIR
+# Instala o Docker (se faltar), pede as credenciais, e arranca o bot.
+# Modo web (por omissão): sem login de conta. Modo account: faz o login do Telegram.
+# Variáveis opcionais (sem perguntas): API_ID API_HASH BOT_TOKEN OWNER_ID MODE DEFAULT_CODE INSTALL_DIR
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,7 +42,8 @@ systemctl enable --now docker >/dev/null 2>&1 || true
 # ---- 3. copiar ficheiros ----
 say "A instalar em $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR/data"
-for f in app requirements.txt Dockerfile docker-compose.yml .env.example botctl.sh README.md; do
+for f in app requirements.txt Dockerfile docker-compose.yml botctl.sh README.md; do
+  [ -e "$SRC_DIR/$f" ] || die "Falta o ficheiro $f em $SRC_DIR"
   rm -rf "${INSTALL_DIR:?}/$f"
   cp -a "$SRC_DIR/$f" "$INSTALL_DIR/$f"
 done
@@ -52,27 +54,56 @@ cd "$INSTALL_DIR"
 # ---- 4. configuração ----
 if [ -f .env ] && [ -z "${FORCE_ENV:-}" ]; then
   warn "Já existe um .env. Vou mantê-lo (FORCE_ENV=1 para refazer)."
+  grep -q '^MODE=' .env || { echo "MODE=web" >> .env; warn "Acrescentei MODE=web ao .env."; }
 else
-  say "Credenciais do Telegram"
+  say "Configuração"
   cat <<'TXT'
   1) API_ID e API_HASH: https://my.telegram.org -> "API development tools" -> cria uma app.
   2) BOT_TOKEN: no Telegram, fala com @BotFather -> /newbot (é o teu painel de controlo).
+  3) OWNER_ID: o teu ID numérico (fala com o @userinfobot). O bot só responde a ti.
 TXT
   ask API_ID "API_ID (número)"
   ask API_HASH "API_HASH" secret
   ask BOT_TOKEN "BOT_TOKEN (do @BotFather)" secret
+  ask OWNER_ID "OWNER_ID (o teu ID numérico)"
+  if [ -z "${MODE:-}" ]; then
+    if [ -t 0 ]; then
+      echo
+      echo "Modo de leitura:"
+      echo "  1) web      - SEM conta. Lê canais públicos pela web. (recomendado)"
+      echo "  2) account  - com a tua conta (grupos privados, emojis premium)."
+      read -rp "Escolhe [1]: " m || true
+      case "${m:-1}" in 2) MODE=account ;; *) MODE=web ;; esac
+    else
+      MODE=web
+    fi
+  fi
   DEFAULT_CODE="${DEFAULT_CODE:-}"
   if [ -z "$DEFAULT_CODE" ] && [ -t 0 ]; then
     read -rp "O teu código de desconto (Enter para definir depois com /codigo): " DEFAULT_CODE || true
   fi
   umask 077
-  sed -e "s|^API_ID=.*|API_ID=${API_ID}|" \
-      -e "s|^API_HASH=.*|API_HASH=${API_HASH}|" \
-      -e "s|^BOT_TOKEN=.*|BOT_TOKEN=${BOT_TOKEN}|" \
-      -e "s|^DEFAULT_CODE=.*|DEFAULT_CODE=${DEFAULT_CODE}|" \
-      .env.example > .env
+  {
+    echo "API_ID=$(printf '%s' "$API_ID" | tr -cd '0-9')"
+    echo "API_HASH=$(printf '%s' "$API_HASH" | tr -cd '0-9a-fA-F')"
+    echo "BOT_TOKEN=$(printf '%s' "$BOT_TOKEN" | tr -d ' \r\n')"
+    echo "MODE=$MODE"
+    echo "OWNER_ID=$(printf '%s' "$OWNER_ID" | tr -cd '0-9')"
+    echo "DEFAULT_CODE=$(printf '%s' "$DEFAULT_CODE" | tr -d '\r\n')"
+    echo "MAX_PER_HOUR=12"
+    echo "MIN_INTERVAL_SEC=20"
+    echo "DEDUP_HOURS=24"
+    echo "IDLE_ALERT_HOURS=12"
+    echo "REQUIRE_PHOTO=true"
+    echo "WEB_POLL_SEC=120"
+  } > .env
   chmod 600 .env
 fi
+MODE_NOW="$(grep -E '^MODE=' .env | tail -1 | cut -d= -f2)"
+
+# validação rápida (não mostra segredos)
+api_hash_len=$(grep -E '^API_HASH=' .env | tail -1 | cut -d= -f2 | tr -d '\r\n' | wc -c)
+[ "$api_hash_len" -eq 32 ] || warn "Atenção: o API_HASH não tem 32 caracteres (tem $api_hash_len). Confirma-o em my.telegram.org."
 
 # a pasta de dados pertence ao utilizador do contentor (uid 10001)
 chown -R 10001:10001 data
@@ -82,12 +113,11 @@ chmod 700 data
 say "A construir a imagem (1-2 minutos)"
 docker compose build
 
-# ---- 6. login ----
-if [ -f data/user.session ]; then
-  warn "Já existe uma sessão de Telegram. A saltar o login."
-else
+# ---- 6. login (só modo account) ----
+if [ "$MODE_NOW" = "account" ]; then
   say "Login da tua conta de Telegram"
-  echo "Vais receber um código no Telegram (e a palavra-passe de 2 passos, se tiveres)."
+  echo "Escreve o teu NÚMERO DE TELEMÓVEL (+351...), não o token do bot."
+  echo "(Se a conta já estiver autenticada, não pergunta nada.)"
   [ -t 0 ] || die "O login precisa de um terminal interativo. Corre depois: botctl login"
   docker compose run --rm -it bot python -m app.login
 fi
@@ -99,16 +129,27 @@ docker compose up -d
 sleep 3
 docker compose ps
 
+if [ "$MODE_NOW" = "account" ]; then
 cat <<'TXT'
 
-Instalado. Agora, no Telegram:
-  1. Abre o teu bot (o do @BotFather) e envia /start
-  2. /escolher   -> grupos de origem
-  3. /destino    -> o teu canal (a tua conta tem de ser admin)
-  4. /linkmodelo -> cola um link teu de um produto da loja (gerado na tua conta)
-  5. /codigo     -> o teu código de desconto
-  6. /modelo     -> texto e emojis (premium incluídos)
+Instalado (modo com conta). No Telegram, no teu bot (@BotFather):
+  1. /start
+  2. /escolher   -> grupos de origem          3. /destino -> o teu canal
+  4. /linkmodelo -> um link teu de um produto  5. /codigo  -> o teu código
   O bot começa em modo MANUAL (aprovas cada oferta). Quando confiares: /auto
-
-Gestão no servidor: botctl status | logs | restart | update | backup | login | uninstall
 TXT
+else
+cat <<'TXT'
+
+Instalado (modo web, sem conta). Faz isto no Telegram:
+  1. Adiciona o teu bot como ADMINISTRADOR do teu canal (permissão de publicar).
+  2. Abre o bot e envia /start
+  3. /adicionar t.me/nomedocanal   -> canal PÚBLICO de origem
+  4. /destino @teucanal            -> o teu canal
+  5. /linkmodelo LINK              -> um link teu de um produto da loja
+  6. /codigo CODIGO                -> o teu código
+  O bot começa em modo MANUAL (aprovas cada oferta). Quando confiares: /auto
+TXT
+fi
+echo
+echo "Gestão no servidor: botctl status | logs | restart | update | backup | login | uninstall"

@@ -1,10 +1,16 @@
-"""Bot de ofertas: lê grupos, converte o link para o teu e publica no teu canal.
+"""Bot de ofertas: lê ofertas, converte o link para o teu e publica no teu canal.
 
-Duas ligações ao Telegram na mesma aplicação:
-  - a TUA conta (userbot): lê os grupos de origem e publica no canal
-    (é a única forma de ler grupos onde não podes adicionar bots e de enviar
-    emojis premium);
-  - um bot normal (BotFather): é o teu painel de controlo, só responde a ti.
+Dois modos (variável MODE no .env):
+
+  web      (por omissão) SEM conta. Lê canais PÚBLICOS pela pré-visualização web
+           (t.me/s/canal) e publica com o bot, que tem de ser administrador do
+           teu canal de destino. Ninguém no canal de origem dá por nada.
+           Sem emojis premium (um bot normal não os pode enviar).
+
+  account  Usa a tua conta (userbot) para ler grupos/canais, mesmo privados, e
+           publicar (com emojis premium, se a conta tiver Premium).
+
+Em ambos há um bot de controlo (BotFather) que só responde a ti.
 """
 from __future__ import annotations
 
@@ -12,6 +18,7 @@ import asyncio
 import html
 import io
 import logging
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -22,8 +29,9 @@ from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 from telethon.tl.types import MessageEntityCustomEmoji
 
-from . import links, render
+from . import links, render, webfeed
 from .config import Config
+from .links import UA
 from .parser import Offer, find_urls, parse
 from .store import Store
 
@@ -40,17 +48,17 @@ AJUDA = """<b>Comandos</b>
 /manual – cada oferta chega aqui para aprovares
 /auto – publica sozinho
 /codigo CODIGO – muda o teu código de desconto
-/modelo – ver/mudar o modelo da mensagem (aceita emojis premium)
+/modelo – ver/mudar o modelo da mensagem
 /linkmodelo LINK – cola um link teu da loja (gerado na tua conta)
 /limite N – máximo de publicações por hora
 
-<b>Grupos</b>
-/escolher – escolher grupos de origem (botões)
-/adicionar LINK – entrar num grupo por link e usá-lo como fonte
-/fontes – ver fontes ativas · /remover – tirar uma fonte
-/topico ID_FONTE ID_TOPICO – só copiar de um tópico (0 = todos)
-/destino – escolher o canal onde publicar
-/recarregar – recarregar o ficheiro rules.json"""
+<b>Origem e destino</b>
+/adicionar t.me/canal – canal público a copiar (modo web) ou grupo (modo conta)
+/fontes – ver fontes · /remover – tirar uma fonte
+/destino @canal – canal onde publicar (o bot tem de ser administrador)
+/recarregar – recarregar o ficheiro rules.json
+
+<i>Só modo conta:</i> /escolher (botões), /topico ID_FONTE ID_TOPICO"""
 
 
 @dataclass
@@ -58,6 +66,9 @@ class Job:
     chat_id: int
     msg_id: int
     offer: Offer
+    photo_url: str | None = None
+    web: bool = False
+    origin: str = ""
 
 
 def msg_link(chat_id: int, msg_id: int) -> str:
@@ -93,8 +104,9 @@ def topic_of(m) -> int:
 class App:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self.web = cfg.mode == "web"
         self.store = Store(cfg.db_path)
-        self.client = TelegramClient(cfg.user_session, cfg.api_id, cfg.api_hash)
+        self.client = None if self.web else TelegramClient(cfg.user_session, cfg.api_id, cfg.api_hash)
         self.bot = TelegramClient(cfg.bot_session, cfg.api_id, cfg.api_hash)
         self.http = links.make_client()
         self.queue: asyncio.Queue[Job] = asyncio.Queue()
@@ -103,6 +115,7 @@ class App:
         self.awaiting: str | None = None
         self.idle_alerted = False
         self.warned_template = False
+        self.web_fail: dict[str, int] = {}
         self.started = time.time()
 
     # ---------- definições ----------
@@ -129,49 +142,64 @@ class App:
     def max_per_hour(self) -> int:
         return int(self.s("max_per_hour", self.cfg.max_per_hour))
 
+    @property
+    def web_sources(self) -> list[str]:
+        return list(self.s("web_sources", []))
+
+    def n_sources(self) -> int:
+        return len(self.web_sources) if self.web else len(self.store.list_sources())
+
     # ---------- avisos ----------
     async def notify(self, text: str, **kw) -> None:
         try:
             await self.bot.send_message(self.owner, text, parse_mode="html", **kw)
         except Exception as e:  # o dono ainda não abriu o bot, etc.
-            log.warning("Aviso via bot falhou (%s); a enviar para as Mensagens Guardadas", e)
-            try:
-                await self.client.send_message("me", re.sub(r"<[^>]+>", "", text))
-            except Exception:
-                log.exception("Não consegui avisar o dono")
+            log.warning("Aviso via bot falhou: %s", e)
+            if self.client:
+                try:
+                    await self.client.send_message("me", re.sub(r"<[^>]+>", "", text))
+                except Exception:
+                    log.exception("Não consegui avisar o dono")
 
     # ---------- arranque ----------
     async def start(self) -> None:
-        await self.client.connect()
-        if not await self.client.is_user_authorized():
-            raise SystemExit("Conta não autenticada. Corre: botctl login")
-        me = await self.client.get_me()
-        self.premium = bool(getattr(me, "premium", False))
-        if not self.owner:
-            self.owner = me.id
+        tasks = []
+        if not self.web:
+            await self.client.connect()
+            if not await self.client.is_user_authorized():
+                raise SystemExit("Conta não autenticada. Corre: botctl login")
+            me = await self.client.get_me()
+            if getattr(me, "bot", False):
+                raise SystemExit(
+                    "A sessão está ligada a um BOT (usaste o token no login). "
+                    "Apaga data/user.session e faz 'botctl login' com um número de telemóvel."
+                )
+            self.premium = bool(getattr(me, "premium", False))
+            if not self.owner:
+                self.owner = me.id
+            self.client.add_event_handler(self.on_source_message, events.NewMessage())
+            tasks += [self.client.run_until_disconnected()]
+        else:
+            tasks += [self.web_poller()]
+
         await self.bot.start(bot_token=self.cfg.bot_token)
         links.load_rules(self.cfg.rules_path)  # cria o ficheiro por omissão
-
-        self.client.add_event_handler(self.on_source_message, events.NewMessage())
         self.bot.add_event_handler(
             self.on_command, events.NewMessage(from_users=self.owner, incoming=True)
         )
         self.bot.add_event_handler(self.on_button, events.CallbackQuery())
 
-        log.info("Pronto. Dono=%s premium=%s modo=%s", self.owner, self.premium, self.mode)
-        await self.notify(
-            "🤖 Bot iniciado.\n"
-            + ("✅ Telegram Premium ativo." if self.premium else "ℹ️ Sem Premium: emojis premium viram emojis normais.")
-            + "\nEnvia /estado ou /ajuda."
+        log.info("Pronto. modo=%s dono=%s premium=%s aprovacao=%s", self.cfg.mode, self.owner, self.premium, self.mode)
+        extra = (
+            "🌐 Modo sem conta (canais públicos pela web)."
+            if self.web
+            else ("✅ Telegram Premium ativo." if self.premium else "ℹ️ Conta sem Premium: emojis premium viram emojis normais.")
         )
-        await asyncio.gather(
-            self.worker(),
-            self.idle_monitor(),
-            self.client.run_until_disconnected(),
-            self.bot.run_until_disconnected(),
-        )
+        await self.notify(f"🤖 Bot iniciado.\n{extra}\nEnvia /estado ou /ajuda.")
+        tasks += [self.worker(), self.idle_monitor(), self.bot.run_until_disconnected()]
+        await asyncio.gather(*tasks)
 
-    # ---------- leitura dos grupos ----------
+    # ---------- leitura: modo conta ----------
     async def on_source_message(self, event) -> None:
         try:
             if self.paused:
@@ -193,6 +221,48 @@ class App:
         except Exception:
             log.exception("Erro a ler mensagem da fonte")
 
+    # ---------- leitura: modo web ----------
+    async def poll_channel(self, name: str) -> None:
+        posts = await webfeed.fetch(self.http, name)
+        key = f"web_last:{name}"
+        last = self.s(key)
+        top = max(p.id for p in posts)
+        if last is None:  # primeira vez: marca o ponto de partida, não publica o histórico
+            self.store.set(key, top)
+            return
+        new = sorted((p for p in posts if p.id > last), key=lambda p: p.id)
+        if new:
+            self.store.set(key, top)
+        for p in new:
+            if self.cfg.require_photo and not p.photo_url:
+                continue
+            offer = parse(p.text, p.urls)
+            if not offer:
+                continue
+            await self.queue.put(
+                Job(0, p.id, offer, photo_url=p.photo_url, web=True, origin=f"https://t.me/{name}/{p.id}")
+            )
+
+    async def web_poller(self) -> None:
+        while True:
+            if not self.paused:
+                for name in self.web_sources:
+                    try:
+                        await self.poll_channel(name)
+                        self.web_fail[name] = 0
+                    except Exception as e:
+                        n = self.web_fail.get(name, 0) + 1
+                        self.web_fail[name] = n
+                        log.warning("Falhou a ler %s (%s): %s", name, n, e)
+                        if n == 5:
+                            await self.notify(
+                                f"⚠️ Não consigo ler o canal <b>{html.escape(name)}</b> há várias tentativas: "
+                                f"{html.escape(str(e))}"
+                            )
+                    await asyncio.sleep(random.uniform(1, 4))
+            await asyncio.sleep(self.cfg.web_poll_sec + random.uniform(0, 15))
+
+    # ---------- processamento ----------
     async def worker(self) -> None:
         while True:
             job = await self.queue.get()
@@ -200,7 +270,7 @@ class App:
                 await self.process(job)
             except Exception as e:
                 log.exception("Erro a processar oferta")
-                await self.notify(f"⚠️ Erro a processar uma oferta: {e}")
+                await self.notify(f"⚠️ Erro a processar uma oferta: {html.escape(str(e))}")
             finally:
                 self.queue.task_done()
 
@@ -217,7 +287,7 @@ class App:
             if r:
                 rule, final = r, res
                 break
-        origem = msg_link(job.chat_id, job.msg_id)
+        origem = job.origin or msg_link(job.chat_id, job.msg_id)
         if not rule:
             await self.notify(
                 "⚠️ Loja não suportada ou link que não consegui seguir. <b>Não publiquei.</b>\n"
@@ -253,11 +323,26 @@ class App:
             "codigo": self.code or None,
             "link": link,
         }
-        payload = {"chat_id": job.chat_id, "msg_id": job.msg_id, "values": values, "key": key}
+        payload = {
+            "chat_id": job.chat_id, "msg_id": job.msg_id, "values": values, "key": key,
+            "web": job.web, "photo_url": job.photo_url, "origin": origem,
+        }
         if self.mode == "auto":
             await self.publish(payload)
         else:
             await self.send_for_approval(payload)
+
+    # ---------- imagens ----------
+    async def _download(self, url: str) -> io.BytesIO | None:
+        try:
+            r = await self.http.get(url, headers={"User-Agent": UA}, follow_redirects=True)
+            r.raise_for_status()
+        except Exception as e:
+            log.warning("Falhou a descarregar a imagem: %s", e)
+            return None
+        f = io.BytesIO(r.content)
+        f.name = "oferta.jpg"
+        return f
 
     # ---------- aprovação manual ----------
     async def send_for_approval(self, payload: dict) -> None:
@@ -266,14 +351,21 @@ class App:
         text = render.to_plain(text)
         buttons = [[Button.inline("✅ Publicar", f"ok:{pid}"), Button.inline("❌ Rejeitar", f"no:{pid}")]]
         try:
-            m = await self.client.get_messages(payload["chat_id"], ids=payload["msg_id"])
-            if m and m.photo:
-                data = await self.client.download_media(m, file=bytes)
-                f = io.BytesIO(data)
-                f.name = "oferta.jpg"
-                await self.bot.send_file(self.owner, f, caption=text[:1000], buttons=buttons, link_preview=False)
+            if payload.get("web"):
+                f = await self._download(payload["photo_url"]) if payload.get("photo_url") else None
+                if f:
+                    await self.bot.send_file(self.owner, f, caption=text[:1000], buttons=buttons)
+                else:
+                    await self.bot.send_message(self.owner, text, buttons=buttons, link_preview=False)
             else:
-                await self.bot.send_message(self.owner, text, buttons=buttons, link_preview=False)
+                m = await self.client.get_messages(payload["chat_id"], ids=payload["msg_id"])
+                if m and m.photo:
+                    data = await self.client.download_media(m, file=bytes)
+                    f = io.BytesIO(data)
+                    f.name = "oferta.jpg"
+                    await self.bot.send_file(self.owner, f, caption=text[:1000], buttons=buttons)
+                else:
+                    await self.bot.send_message(self.owner, text, buttons=buttons, link_preview=False)
         except Exception as e:
             log.warning("Pré-visualização falhou: %s", e)
             await self.notify(
@@ -292,25 +384,39 @@ class App:
     async def publish(self, payload: dict) -> bool:
         dest = self.s("dest")
         if not dest:
-            await self.notify("⚠️ Falta escolher o canal de destino: /destino")
+            await self.notify("⚠️ Falta escolher o canal de destino: /destino @canal")
             return False
-        m = await self.client.get_messages(payload["chat_id"], ids=payload["msg_id"])
-        if not m:
-            await self.notify("⚠️ A mensagem original já não existe. Não publiquei.")
-            return False
+        web = bool(payload.get("web"))
+        photo = None
+        m = None
+        if web:
+            if payload.get("photo_url"):
+                photo = await self._download(payload["photo_url"])
+                if photo is None and self.cfg.require_photo:
+                    await self.notify("⚠️ Não consegui descarregar a imagem. Não publiquei.\n" + payload.get("origin", ""))
+                    return False
+        else:
+            m = await self.client.get_messages(payload["chat_id"], ids=payload["msg_id"])
+            if not m:
+                await self.notify("⚠️ A mensagem original já não existe. Não publiquei.")
+                return False
         await self._throttle()
-        text, spec = render.render(self.template, payload["values"], premium=self.premium)
+        premium = False if web else self.premium
+        text, spec = render.render(self.template, payload["values"], premium=premium)
         ents = [MessageEntityCustomEmoji(o, l, d) for o, l, d in spec] or None
+        sender = self.bot if web else self.client
         for attempt in (1, 2):
             try:
-                if m.photo:
-                    await self.client.send_file(
-                        dest, m.photo, caption=text, formatting_entities=ents, parse_mode=None
-                    )
+                if web:
+                    if photo:
+                        photo.seek(0)
+                        await sender.send_file(dest, photo, caption=text, parse_mode=None)
+                    else:
+                        await sender.send_message(dest, text, parse_mode=None, link_preview=False)
+                elif m.photo:
+                    await sender.send_file(dest, m.photo, caption=text, formatting_entities=ents, parse_mode=None)
                 else:
-                    await self.client.send_message(
-                        dest, text, formatting_entities=ents, parse_mode=None, link_preview=False
-                    )
+                    await sender.send_message(dest, text, formatting_entities=ents, parse_mode=None, link_preview=False)
                 break
             except errors.FloodWaitError as e:
                 if attempt == 2:
@@ -319,10 +425,13 @@ class App:
                 await asyncio.sleep(e.seconds + 1)
             except Exception as e:
                 log.exception("Falhou a publicar")
-                await self.notify(f"⚠️ Falhou a publicação: {e}")
+                await self.notify(
+                    f"⚠️ Falhou a publicação: {html.escape(str(e))}\n"
+                    "Confirma que o bot é administrador do canal de destino com permissão para publicar."
+                )
                 return False
         self.store.mark_posted(
-            payload["key"], payload["chat_id"], payload["msg_id"],
+            payload["key"], payload.get("chat_id") or 0, payload.get("msg_id") or 0,
             payload["values"].get("titulo") or "", payload["values"]["link"],
         )
         self.idle_alerted = False
@@ -334,14 +443,14 @@ class App:
         while True:
             await asyncio.sleep(1800)
             try:
-                if self.paused or self.idle_alerted or not self.store.list_sources():
+                if self.paused or self.idle_alerted or not self.n_sources():
                     continue
                 last = self.store.last_post_ts() or self.started
                 if time.time() - last > self.cfg.idle_alert_hours * 3600:
                     self.idle_alerted = True
                     await self.notify(
                         f"⏰ Há mais de {self.cfg.idle_alert_hours}h sem publicar nada. "
-                        "Pode ser normal, ou o grupo mudou. Vê /estado."
+                        "Pode ser normal, ou a origem mudou. Vê /estado."
                     )
             except Exception:
                 log.exception("idle_monitor")
@@ -361,6 +470,8 @@ class App:
                     await event.respond("Comando desconhecido. /ajuda")
             elif self.awaiting == "modelo":
                 await self.set_template(event)
+            elif self.awaiting == "destino":
+                await self.set_dest_from_message(event)
         except Exception as e:
             log.exception("Erro num comando")
             await event.respond(f"⚠️ Erro: {e}")
@@ -371,20 +482,17 @@ class App:
     cmd_ajuda = cmd_start
 
     async def cmd_estado(self, event, arg):
-        srcs = self.store.list_sources()
         dest = self.s("dest_title") or ("não definido" if not self.s("dest") else str(self.s("dest")))
         rules = links.load_rules(self.cfg.rules_path)
         sem_modelo = [r.name for r in rules if not r.template]
         last = self.store.last_post_ts()
-        ultima = (
-            datetime.fromtimestamp(last).strftime("%d/%m %H:%M") if last else "—"
-        )
+        ultima = datetime.fromtimestamp(last).strftime("%d/%m %H:%M") if last else "—"
         lines = [
             "<b>Estado</b>",
-            f"{'⏸ Em pausa' if self.paused else '▶️ A correr'} · modo <b>{'automático' if self.mode == 'auto' else 'manual (aprovas tu)'}</b>",
-            f"Fontes ativas: {len(srcs)} · Destino: {dest}",
-            f"Código: <code>{self.code or '(vazio)'}</code>",
-            f"Premium: {'sim' if self.premium else 'não'}",
+            f"{'⏸ Em pausa' if self.paused else '▶️ A correr'} · aprovação <b>{'automática' if self.mode == 'auto' else 'manual (aprovas tu)'}</b>",
+            f"Modo: <b>{'sem conta (web)' if self.web else 'com conta'}</b> · Fontes: {self.n_sources()} · Destino: {html.escape(dest)}",
+            f"Código: <code>{html.escape(self.code or '(vazio)')}</code>",
+            (f"Verificação do canal a cada ~{self.cfg.web_poll_sec}s" if self.web else f"Premium: {'sim' if self.premium else 'não'}"),
             f"Últimas 24h: {self.store.count_since(86400)} publicações · última: {ultima}",
             f"Por aprovar: {self.store.count_pending()} · limite/hora: {self.max_per_hour}",
         ]
@@ -410,10 +518,10 @@ class App:
 
     async def cmd_codigo(self, event, arg):
         if not arg:
-            await event.respond(f"Código atual: <code>{self.code or '(vazio)'}</code>\nUso: /codigo NOVO14", parse_mode="html")
+            await event.respond(f"Código atual: <code>{html.escape(self.code or '(vazio)')}</code>\nUso: /codigo NOVO14", parse_mode="html")
             return
         self.store.set("code", arg)
-        await event.respond(f"✅ Código mudado para <code>{arg}</code>", parse_mode="html")
+        await event.respond(f"✅ Código mudado para <code>{html.escape(arg)}</code>", parse_mode="html")
 
     async def cmd_limite(self, event, arg):
         if not arg.isdigit() or not (1 <= int(arg) <= 200):
@@ -424,14 +532,18 @@ class App:
 
     async def cmd_modelo(self, event, arg):
         self.awaiting = "modelo"
+        nota = (
+            "\nℹ️ No modo sem conta os emojis premium não são enviados (saem como emoji normal)."
+            if self.web else ""
+        )
         await event.respond(
             "Modelo atual:\n\n"
             f"<pre>{html.escape(render.to_plain(self.template))}</pre>\n"
-            "Para mudar, envia-me <b>a próxima mensagem</b> já com o texto e os emojis que queres "
-            "(podes usar emojis premium). Usa estes campos:\n"
+            "Para mudar, envia-me <b>a próxima mensagem</b> já com o texto e os emojis que queres. "
+            "Usa estes campos:\n"
             "<code>{titulo}</code> <code>{preco}</code> <code>{codigo}</code> <code>{link}</code>\n"
             "{link} é obrigatório. Se faltar um campo numa oferta (ex.: sem preço), essa linha é omitida.\n"
-            "Qualquer comando cancela.",
+            "Qualquer comando cancela." + nota,
             parse_mode="html",
         )
 
@@ -444,8 +556,8 @@ class App:
         self.store.set("template", tpl)
         n_ce = tpl.count("{ce:")
         extra = ""
-        if n_ce and not self.premium:
-            extra = f"\nℹ️ {n_ce} emoji(s) premium guardados, mas esta conta não tem Premium: saem como emoji normal."
+        if n_ce and (self.web or not self.premium):
+            extra = f"\nℹ️ {n_ce} emoji(s) premium guardados, mas aqui saem como emoji normal."
         preview, _ = render.render(
             tpl, {"titulo": "Adidas Spezial", "preco": "25€", "codigo": self.code or "CODIGO", "link": "https://exemplo"}, premium=False
         )
@@ -462,11 +574,11 @@ class App:
             return
         sample = find_urls(arg)
         sample = sample[0] if sample else arg
+        rules = links.load_rules(self.cfg.rules_path)
         try:
-            sample = await links.resolve(sample, links.load_rules(self.cfg.rules_path), self.http)
+            sample = await links.resolve(sample, rules, self.http)
         except Exception:
             pass
-        rules = links.load_rules(self.cfg.rules_path)
         res = links.template_from_sample(rules, sample)
         if not res:
             await event.respond("⚠️ Não reconheço esse link (loja não suportada ou sem ID de produto).")
@@ -476,7 +588,7 @@ class App:
         links.save_rules(self.cfg.rules_path, rules)
         self.warned_template = False
         await event.respond(
-            f"✅ Link modelo de <b>{rule.name}</b> guardado:\n<code>{template}</code>\n"
+            f"✅ Link modelo de <b>{rule.name}</b> guardado:\n<code>{html.escape(template)}</code>\n"
             "Confirma que o teu identificador de afiliado aparece aí.",
             parse_mode="html",
         )
@@ -496,8 +608,15 @@ class App:
             out.append(f"{when} · {r['title'] or r['key']}\n{r['url']}")
         await event.respond("\n\n".join(out), link_preview=False)
 
-    # ---------- fontes e destino ----------
+    # ---------- fontes ----------
     async def cmd_fontes(self, event, arg):
+        if self.web:
+            names = self.web_sources
+            if not names:
+                await event.respond("Sem fontes. Usa /adicionar t.me/nomedocanal")
+                return
+            await event.respond("<b>Canais públicos</b>\n" + "\n".join(f"• t.me/{html.escape(n)}" for n in names), parse_mode="html")
+            return
         srcs = self.store.list_sources()
         if not srcs:
             await event.respond("Sem fontes. Usa /escolher ou /adicionar LINK.")
@@ -505,9 +624,147 @@ class App:
         lines = ["<b>Fontes</b>"]
         for s in srcs:
             topico = f" · tópico {s.topic_id}" if s.topic_id else ""
-            lines.append(f"• {s.title or s.chat_id} (<code>{s.chat_id}</code>){topico}")
+            lines.append(f"• {html.escape(s.title or str(s.chat_id))} (<code>{s.chat_id}</code>){topico}")
         await event.respond("\n".join(lines), parse_mode="html")
 
+    async def cmd_remover(self, event, arg):
+        if self.web:
+            names = self.web_sources
+            if not names:
+                await event.respond("Sem fontes.")
+                return
+            rows = [[Button.inline(f"🗑 {n}"[:40], f"w:{n}")] for n in names]
+            await event.respond("Qual canal queres remover?", buttons=rows)
+            return
+        srcs = self.store.list_sources()
+        if not srcs:
+            await event.respond("Sem fontes.")
+            return
+        rows = [[Button.inline(f"🗑 {(s.title or str(s.chat_id))[:36]}", f"r:{s.chat_id}")] for s in srcs]
+        await event.respond("Qual fonte queres remover?", buttons=rows)
+
+    async def cmd_adicionar(self, event, arg):
+        if self.web:
+            await self._add_web_source(event, arg)
+            return
+        if not arg:
+            await event.respond("Uso: /adicionar https://t.me/+convite  (ou t.me/nome, ou @nome)")
+            return
+        try:
+            ent = await self._join(arg)
+        except Exception as e:
+            await event.respond(f"⚠️ Não consegui entrar: {e}")
+            return
+        cid = utils.get_peer_id(ent)
+        title = getattr(ent, "title", None) or str(cid)
+        self.store.add_source(cid, title)
+        await event.respond(f"✅ Fonte adicionada: {html.escape(title)} (<code>{cid}</code>)", parse_mode="html")
+
+    async def _add_web_source(self, event, arg):
+        name = webfeed.normalize_channel(arg)
+        if not name:
+            await event.respond(
+                "Uso: /adicionar t.me/nomedocanal\nSó funciona com canais <b>públicos</b> (links de convite privados não).",
+                parse_mode="html",
+            )
+            return
+        try:
+            posts = await webfeed.fetch(self.http, name)
+        except Exception as e:
+            await event.respond(f"⚠️ Não consegui ler t.me/s/{name}: {e}")
+            return
+        names = self.web_sources
+        if name not in names:
+            names.append(name)
+            self.store.set("web_sources", names)
+        self.store.set(f"web_last:{name}", max(p.id for p in posts))
+        await event.respond(
+            f"✅ Canal t.me/{html.escape(name)} adicionado ({len(posts)} mensagens visíveis).\n"
+            "Só publico as ofertas <b>novas</b>, a partir de agora.",
+            parse_mode="html",
+        )
+
+    async def cmd_escolher(self, event, arg):
+        if self.web:
+            await event.respond("No modo sem conta usa /adicionar t.me/nomedocanal (canais públicos).")
+            return
+        rows, _ = await self._dialog_buttons("src")
+        if not rows:
+            await event.respond("Não encontrei grupos. Entra no grupo com a tua conta e tenta de novo, ou usa /adicionar LINK.")
+            return
+        await event.respond("Toca para ligar/desligar grupos de origem (✅ = ativo):", buttons=rows)
+
+    async def cmd_topico(self, event, arg):
+        if self.web:
+            await event.respond("Os tópicos só existem no modo com conta.")
+            return
+        parts = arg.split()
+        if len(parts) != 2 or not all(re.fullmatch(r"-?\d+", p) for p in parts):
+            await event.respond("Uso: /topico ID_FONTE ID_TOPICO (0 = todos). O ID da fonte vê-se em /fontes.")
+            return
+        chat_id, topic = int(parts[0]), int(parts[1])
+        ok = self.store.set_topic(chat_id, topic or None)
+        await event.respond("✅ Guardado." if ok else "⚠️ Fonte não encontrada.")
+
+    # ---------- destino ----------
+    async def cmd_destino(self, event, arg):
+        if not self.web:
+            rows, _ = await self._dialog_buttons("dest")
+            if not rows:
+                await event.respond("Não encontrei canais onde possas publicar. A tua conta tem de ser administradora do canal.")
+                return
+            await event.respond("Escolhe o canal onde publico:", buttons=rows)
+            return
+        if arg:
+            name = webfeed.normalize_channel(arg)
+            if not name:
+                await event.respond("Uso: /destino @nomedocanal (canal público). Para um canal privado, envia /destino e reencaminha-me uma mensagem do canal.")
+                return
+            try:
+                ent = await self.bot.get_entity(name)
+            except Exception as e:
+                await event.respond(f"⚠️ Não encontrei o canal: {e}")
+                return
+            await self._save_dest(event, ent)
+            return
+        self.awaiting = "destino"
+        await event.respond(
+            "Primeiro adiciona <b>este bot como administrador</b> do teu canal (com permissão para publicar mensagens).\n"
+            "Depois envia-me o <code>@nomedocanal</code>, ou <b>reencaminha-me uma mensagem</b> do canal (serve para canais privados).",
+            parse_mode="html",
+        )
+
+    async def set_dest_from_message(self, event) -> None:
+        self.awaiting = None
+        fwd = event.message.forward
+        ent = None
+        if fwd:
+            ent = await fwd.get_chat()
+        else:
+            name = webfeed.normalize_channel(event.raw_text or "")
+            if name:
+                ent = await self.bot.get_entity(name)
+        if ent is None:
+            await event.respond("⚠️ Não percebi. Envia /destino e tenta outra vez com @nomedocanal ou uma mensagem reencaminhada.")
+            return
+        await self._save_dest(event, ent)
+
+    async def _save_dest(self, event, ent) -> None:
+        cid = utils.get_peer_id(ent)
+        title = getattr(ent, "title", None) or str(cid)
+        aviso = ""
+        try:
+            me = await self.bot.get_me()
+            perms = await self.bot.get_permissions(ent, me)
+            if not perms.is_admin or not getattr(perms, "post_messages", True):
+                aviso = "\n⚠️ O bot ainda <b>não é administrador</b> com permissão para publicar. Adiciona-o como admin antes de ligares o /auto."
+        except Exception:
+            aviso = "\n⚠️ Não consegui confirmar que o bot é administrador do canal. Garante que é, com permissão para publicar."
+        self.store.set("dest", cid)
+        self.store.set("dest_title", title)
+        await event.respond(f"✅ Vou publicar em: <b>{html.escape(title)}</b>{aviso}", parse_mode="html")
+
+    # ---------- só modo conta ----------
     async def _dialog_buttons(self, kind: str):
         rows, titles = [], {}
         count = 0
@@ -530,51 +787,6 @@ class App:
             if count >= 40:
                 break
         return rows, titles
-
-    async def cmd_escolher(self, event, arg):
-        rows, _ = await self._dialog_buttons("src")
-        if not rows:
-            await event.respond("Não encontrei grupos. Entra no grupo com a tua conta e tenta de novo, ou usa /adicionar LINK.")
-            return
-        await event.respond("Toca para ligar/desligar grupos de origem (✅ = ativo):", buttons=rows)
-
-    async def cmd_destino(self, event, arg):
-        rows, _ = await self._dialog_buttons("dest")
-        if not rows:
-            await event.respond("Não encontrei canais onde possas publicar. A tua conta tem de ser administradora do canal.")
-            return
-        await event.respond("Escolhe o canal onde publico:", buttons=rows)
-
-    async def cmd_remover(self, event, arg):
-        srcs = self.store.list_sources()
-        if not srcs:
-            await event.respond("Sem fontes.")
-            return
-        rows = [[Button.inline(f"🗑 {(s.title or str(s.chat_id))[:36]}", f"r:{s.chat_id}")] for s in srcs]
-        await event.respond("Qual fonte queres remover?", buttons=rows)
-
-    async def cmd_topico(self, event, arg):
-        parts = arg.split()
-        if len(parts) != 2 or not all(re.fullmatch(r"-?\d+", p) for p in parts):
-            await event.respond("Uso: /topico ID_FONTE ID_TOPICO (0 = todos). O ID da fonte vê-se em /fontes.")
-            return
-        chat_id, topic = int(parts[0]), int(parts[1])
-        ok = self.store.set_topic(chat_id, topic or None)
-        await event.respond("✅ Guardado." if ok else "⚠️ Fonte não encontrada.")
-
-    async def cmd_adicionar(self, event, arg):
-        if not arg:
-            await event.respond("Uso: /adicionar https://t.me/+convite  (ou t.me/nome, ou @nome)")
-            return
-        try:
-            ent = await self._join(arg)
-        except Exception as e:
-            await event.respond(f"⚠️ Não consegui entrar: {e}")
-            return
-        cid = utils.get_peer_id(ent)
-        title = getattr(ent, "title", None) or str(cid)
-        self.store.add_source(cid, title)
-        await event.respond(f"✅ Fonte adicionada: {title} (<code>{cid}</code>)", parse_mode="html")
 
     async def _join(self, link: str):
         link = link.strip()
@@ -615,7 +827,12 @@ class App:
                 await event.answer("A publicar…")
                 ok = await self.publish(payload)
                 await self._mark(event, "✅ Publicada" if ok else "⚠️ Falhou a publicação")
-            elif kind == "s":
+            elif kind == "w":
+                names = [n for n in self.web_sources if n != val]
+                self.store.set("web_sources", names)
+                await event.answer("Removido.")
+                await event.edit(f"🗑 Canal {val} removido.")
+            elif kind == "s" and self.client:
                 cid = int(val)
                 if self.store.get_source(cid):
                     self.store.remove_source(cid)
@@ -630,7 +847,7 @@ class App:
                     await event.answer("Fonte ligada.")
                 rows, _ = await self._dialog_buttons("src")
                 await event.edit("Toca para ligar/desligar grupos de origem (✅ = ativo):", buttons=rows)
-            elif kind == "d":
+            elif kind == "d" and self.client:
                 cid = int(val)
                 title = ""
                 async for d in self.client.iter_dialogs(limit=300):
@@ -664,6 +881,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logging.getLogger("telethon").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     cfg = Config.load()
     app = App(cfg)
     asyncio.run(app.start())

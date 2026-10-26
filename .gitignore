@@ -1,0 +1,7 @@
+.env
+data/
+__pycache__/
+.pytest_cache/
+*.session
+*.session-journal
+backup-*.tar.gz

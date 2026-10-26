@@ -1,32 +1,43 @@
 # Bot de ofertas (Telegram)
 
-Lê ofertas de um grupo, troca o código de desconto e o link pelo teu, copia a imagem e publica no teu canal. Corre num contentor Docker no teu VPS.
+Lê ofertas de um canal, troca o código de desconto e o link pelo teu, copia a imagem e publica no teu canal. Corre num contentor Docker no teu VPS.
 
-## Instalar (um comando)
+## Dois modos (`MODE` no `.env`)
+
+| | **web** (por omissão) | **account** |
+|---|---|---|
+| Precisa de login de conta | **Não** | Sim (`botctl login`, com número de telemóvel) |
+| Origem | Canais **públicos** (lê `t.me/s/canal`) | Grupos e canais, mesmo privados |
+| Quem publica | O bot (tem de ser admin do teu canal) | A tua conta |
+| Emojis premium | Não | Sim (se a conta tiver Premium) |
+| Visível na origem | Invisível (não entra no canal) | Aparece como subscritor/membro |
+| Atraso | ~2 minutos | Imediato |
+
+## Instalar
 
 ```bash
-unzip ofertas-bot.zip && cd ofertas-bot && bash install.sh
+git clone https://github.com/troberto2001/ofertas-bot.git && cd ofertas-bot && bash install.sh
 ```
 
-O instalador instala o Docker (se faltar), pede as credenciais, faz o login do Telegram e arranca o bot. Precisas de ter à mão:
+O instalador instala o Docker (se faltar), pede as credenciais e arranca o bot. Precisas de:
 
 1. **API_ID e API_HASH**: https://my.telegram.org → *API development tools*.
-2. **BOT_TOKEN**: no Telegram, fala com o **@BotFather** → `/newbot`. É o teu painel de controlo.
-3. A tua conta de Telegram (o login pede o código que recebes no telemóvel).
+2. **BOT_TOKEN**: no Telegram, fala com o **@BotFather** → `/newbot`.
+3. **OWNER_ID**: o teu ID numérico (fala com o **@userinfobot**). O bot só responde a ti.
 
-## Configurar (no Telegram, no teu bot)
+## Configurar (modo web) — no Telegram
 
-| Passo | Comando |
-|---|---|
-| Abrir o painel | `/start` |
-| Grupos de origem | `/escolher` (botões) ou `/adicionar LINK` |
-| Canal de destino | `/destino` (a tua conta tem de ser admin do canal) |
-| O teu link de afiliado | `/linkmodelo LINK` com um link de um produto gerado na tua conta |
-| O teu código | `/codigo MEUCODIGO` |
-| Texto e emojis | `/modelo` (aceita emojis premium) |
-| Publicar sozinho | `/auto` (começa em `/manual`: aprovas cada oferta) |
+1. Adiciona o teu bot como **administrador do teu canal** (com permissão de publicar).
+2. Abre o bot, `/start`.
+3. `/adicionar t.me/nomedocanal` — canal público de origem.
+4. `/destino @teucanal` — o teu canal (privado: `/destino` e reencaminha-lhe uma mensagem do canal).
+5. `/linkmodelo LINK` — um link de um produto gerado na tua conta de afiliado.
+6. `/codigo MEUCODIGO` — o teu código.
+7. Começa em **manual** (aprovas cada oferta). Quando confiares: `/auto`.
 
-Outros: `/estado` `/ultimas` `/pausar` `/retomar` `/limite N` `/fontes` `/remover` `/topico` `/recarregar`.
+Só publica ofertas **novas** a partir do momento em que adicionas o canal.
+
+Outros comandos: `/estado` `/ultimas` `/pausar` `/retomar` `/limite N` `/fontes` `/remover` `/modelo` `/recarregar`.
 
 ### Como converte o link
 
@@ -38,9 +49,9 @@ Se não conseguir converter (loja desconhecida, formato mudou, falta o `/linkmod
 
 Lojas: vêm definidas em `data/rules.json` (a Hacoo vem de origem). Para outra loja, acrescenta uma regra com `host_re`, `id_re` (o grupo 1 é o ID) e `template`, e envia `/recarregar`.
 
-## Emojis premium
+## Modo account
 
-O modelo guarda os emojis premium que lhe enviares. Só são **enviados** se a conta com que fizeste login tiver Telegram Premium; quem lê vê-os sem Premium. Sem Premium, saem como o emoji normal equivalente.
+Define `MODE=account` no `.env`, corre `botctl login` e, no pedido, escreve o **número de telemóvel** (nunca o token do BotFather: um bot não lê grupos). Depois usa `/escolher` e `/destino` (botões). Emojis premium: `/modelo` e envia a mensagem com os emojis.
 
 ## Gestão no servidor
 
@@ -48,19 +59,20 @@ O modelo guarda os emojis premium que lhe enviares. Só são **enviados** se a c
 botctl status | logs | restart | update | backup | login | uninstall [--purge]
 ```
 
+Atualizar o código: `cd ~/ofertas-bot && git pull && bash install.sh` (mantém o `.env` e os dados).
+
 ## Segurança
 
-- `data/user.session` dá acesso total à tua conta de Telegram. Está com permissões restritas; não a partilhes nem a envies a ninguém. `botctl backup` inclui-a.
-- O painel só responde ao dono (a conta do login, ou `OWNER_ID`).
-- O contentor não expõe portas e corre sem privilégios.
-- Usar a conta pessoal como userbot não é oficialmente suportado pelo Telegram. O risco é baixo com o limite de publicações por hora (`/limite`) e só leitura nos grupos; considera uma conta separada.
+- O painel só responde ao dono (`OWNER_ID`). O contentor não expõe portas e corre sem privilégios.
+- `data/` contém a base de dados e, no modo account, a sessão da conta (`user.session`), que dá acesso total à conta: não a partilhes. `botctl backup` inclui-a.
+- Modo account: usar a conta pessoal como userbot não é oficialmente suportado pelo Telegram. Risco baixo com o limite de publicações por hora (`/limite`); considera uma conta separada.
 
 ## Cuidados legais
 
-Confirma que as regras do grupo de origem e do programa de afiliados permitem republicar o conteúdo, e que os artigos promovidos são legítimos (marcas a preços muito baixos podem ser contrafações).
+Confirma que as regras do canal de origem e do programa de afiliados permitem republicar o conteúdo, e que os artigos promovidos são legítimos (marcas a preços muito baixos podem ser contrafações).
 
-## Limitações conhecidas
+## Limitações
 
-- Os redirecionamentos feitos só por JavaScript complexo não são seguidos (os HTTP, `meta refresh` e `location=` simples sim).
-- Só copia a primeira foto de cada mensagem (não álbuns completos).
-- Formatação (negrito, etc.) do modelo não é guardada, só emojis premium.
+- Modo web: só canais públicos com pré-visualização web; só a primeira foto de cada mensagem; sem emojis premium.
+- Redirecionamentos feitos só por JavaScript complexo não são seguidos (HTTP, `meta refresh` e `location=` simples sim).
+- Canais com "restringir guardar conteúdo" podem impedir a cópia da imagem no modo account.

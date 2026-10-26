@@ -36,6 +36,8 @@ class Config:
     dedup_hours: int
     idle_alert_hours: int
     require_photo: bool
+    mode: str = "web"          # "web" = sem conta (canal público) | "account" = com conta
+    web_poll_sec: int = 120
 
     @property
     def user_session(self) -> str:
@@ -71,6 +73,14 @@ class Config:
         data_dir = Path(os.environ.get("DATA_DIR", "/data"))
         data_dir.mkdir(parents=True, exist_ok=True)
         owner = _int("OWNER_ID", 0) or None
+        mode = os.environ.get("MODE", "web").strip().lower() or "web"
+        if mode not in ("web", "account"):
+            raise SystemExit("MODE tem de ser 'web' ou 'account'")
+        if need_bot and mode == "web" and not owner:
+            raise SystemExit(
+                "No modo web é preciso OWNER_ID no .env (o teu ID numérico de Telegram: "
+                "fala com o @userinfobot)."
+            )
         return Config(
             api_id=api_id,
             api_hash=api_hash,
@@ -83,4 +93,6 @@ class Config:
             dedup_hours=_int("DEDUP_HOURS", 24),
             idle_alert_hours=_int("IDLE_ALERT_HOURS", 12),
             require_photo=_bool("REQUIRE_PHOTO", True),
+            mode=mode,
+            web_poll_sec=max(60, _int("WEB_POLL_SEC", 120)),
         )
