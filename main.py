@@ -706,7 +706,7 @@ class App:
         enabled = self.s("translate_titles", True)
         await event.respond(
             f"Tradução do produto ES → PT: {'ligada' if enabled else 'desligada'}. "
-            "Traduz nomes de produto reconhecidos no início do título; mantém a marca e o modelo que vêm a seguir. "
+            "Traduz nomes de produto e frases descritivas reconhecidas, incluindo depois da marca. Mantém marcas, modelos e referências. "
             "Aplica-se às próximas ofertas preparadas. Usa /exemplo para testar."
         )
 
