@@ -21,6 +21,7 @@ import logging
 import random
 import re
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -31,6 +32,7 @@ from telethon.tl.types import MessageEntityCustomEmoji
 
 from . import links, render, webfeed
 from .config import Config
+from .channel_fill import FillRun, interleave
 from .hacoo import HacooError, HacooGenerator, SessionVault
 from .links import UA
 from .parser import Offer, find_urls, parse
@@ -46,6 +48,8 @@ AJUDA = """<b>Comandos</b>
 /ultimas – últimas publicações
 /exemplo – FORÇAR: mostra as 5 ofertas mais recentes da origem (ou /exemplo 10)
 /teste – igual, mas SEM link (para testar formato, imagem e permissões do canal)
+/encher – publicar 50 ofertas, fontes intercaladas e aleatórias, com tradução
+/encher_estado · /encher_parar – consultar ou interromper o enchimento
 /pausar · /retomar – parar/continuar
 
 <b>Publicação</b>
@@ -134,6 +138,8 @@ class App:
         self.command_lock = asyncio.Lock()
         self.process_lock = asyncio.Lock()
         self.publish_lock = asyncio.Lock()
+        self.fill_run: FillRun | None = None
+        self.fill_task: asyncio.Task | None = None
 
     # ---------- definições ----------
     def s(self, key: str, default=None):
@@ -221,6 +227,10 @@ class App:
             await asyncio.gather(*tasks)
         finally:
             self._cancel_hacoo_login()
+            if self.fill_task and not self.fill_task.done():
+                self.fill_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self.fill_task
             await self.hacoo.close()
             await self.http.aclose()
 
@@ -322,14 +332,16 @@ class App:
             await self.notify(text)
         return text
 
-    async def process(self, job: Job, force: bool = False, nolink: bool = False) -> str | None:
+    async def process(self, job: Job, force: bool = False, nolink: bool = False, *, fill: FillRun | None = None) -> str | None:
         async with self.process_lock:
-            return await self._process(job, force, nolink)
+            return await self._process(job, force, nolink, fill=fill)
 
-    async def _process(self, job: Job, force: bool = False, nolink: bool = False) -> str | None:
+    async def _process(self, job: Job, force: bool = False, nolink: bool = False, *, fill: FillRun | None = None) -> str | None:
         """Converte e publica/envia para aprovação. Devolve o motivo se não avançou.
         force=True: ignora o anti-duplicados e envia sempre para aprovação manual.
         nolink=True (teste): não converte o link; mostra a oferta sem a linha do link."""
+        if fill is not None and (not self._fill_allowed(fill) or not self.source_allowed(job.web, job.chat_id, job.origin)):
+            return "Enchimento interrompido ou fonte já não autorizada."
         if not force and (self.paused or not self.source_allowed(job.web, job.chat_id, job.origin)):
             return None
         if nolink:
@@ -350,25 +362,27 @@ class App:
         origem = job.origin or msg_link(job.chat_id, job.msg_id)
         if not rule:
             return await self._fail(
-                force,
+                force or fill is not None,
                 "⚠️ Loja não suportada ou link que não consegui seguir. <b>Não publiquei.</b>\n"
                 f"Links: {html.escape(' '.join(job.offer.urls))}\nOrigem: {origem}",
             )
         pid = links.extract_id(rule, final)
         if not pid:
             return await self._fail(
-                force,
+                force or fill is not None,
                 f"⚠️ O formato do link da loja <b>{rule.name}</b> mudou (não encontro o ID do produto). "
                 f"<b>Não publiquei.</b>\n{html.escape(final)}\nOrigem: {origem}",
             )
         key = f"{rule.name}:{pid}"
-        if not force and (self.store.was_posted(key, self.cfg.dedup_hours) or self.store.has_pending_key(key)):
+        if fill is not None and key in fill.seen:
+            return "Produto repetido nesta execução."
+        if fill is None and not force and (self.store.was_posted(key, self.cfg.dedup_hours) or self.store.has_pending_key(key)):
             return None
         if rule.name == "hacoo" and self.s("hacoo_generator", False):
             try:
                 link = await self.hacoo.convert(self.owner, final)
             except HacooError as exc:
-                return await self._fail(force, "⚠️ " + html.escape(str(exc)) + " Não publiquei.")
+                return await self._fail(force or fill is not None, "⚠️ " + html.escape(str(exc)) + " Não publiquei.")
         else:
             link = links.build_link(rule, pid, final)
         if not link:
@@ -377,14 +391,16 @@ class App:
                 f"<b>{rule.name}</b>. Gera um link de um produto na tua conta e envia:\n"
                 "<code>/linkmodelo SEU_LINK</code>\nAté lá não publico nada."
             )
-            if not force and not self.warned_template:
+            if fill is None and not force and not self.warned_template:
                 self.warned_template = True
                 await self.notify(msg)
             return msg
 
         key = f"{rule.name}:{pid}"
         note = ""
-        if force:
+        if fill is not None:
+            pass  # Explicit batch can reuse history, but not a product already in this run.
+        elif force:
             if self.store.was_posted(key, self.cfg.dedup_hours):
                 note = f"⚠️ Já publicada nas últimas {self.cfg.dedup_hours}h\n\n"
         elif self.store.was_posted(key, self.cfg.dedup_hours) or self.store.has_pending_key(key):
@@ -392,7 +408,7 @@ class App:
             return None
 
         values = {
-            "titulo": self.product_title(job.offer.title),
+            "titulo": translate_product_title(job.offer.title) if fill is not None else self.product_title(job.offer.title),
             "preco": job.offer.price,
             "codigo": self.code or None,
             "link": link,
@@ -401,7 +417,12 @@ class App:
             "chat_id": job.chat_id, "msg_id": job.msg_id, "values": values, "key": key,
             "web": job.web, "photo_url": job.photo_url, "origin": origem,
         }
-        if force:
+        if fill is not None:
+            if not await self.publish(payload, fill=fill):
+                return "Oferta não publicada."
+            fill.seen.add(key)
+            fill.published += 1
+        elif force:
             await self.send_for_approval(payload, note=note)
         elif self.mode == "auto":
             await self.publish(payload)
@@ -457,18 +478,40 @@ class App:
         src = self.store.get_source(chat_id)
         return bool(src and src.active and chat_id != self.s("dest"))
 
-    async def _throttle(self) -> None:
+    def _fill_allowed(self, run: FillRun) -> bool:
+        if self.paused or self.s("dest") != run.destination:
+            run.stop.set()
+        return not run.stop.is_set()
+
+    async def _publication_wait(self, seconds: float, fill: FillRun | None = None) -> bool:
+        if fill is None:
+            await asyncio.sleep(max(0, seconds))
+            return not self.paused
+        if not self._fill_allowed(fill):
+            return False
+        try:
+            await asyncio.wait_for(fill.stop.wait(), timeout=max(0, seconds))
+        except asyncio.TimeoutError:
+            pass
+        return self._fill_allowed(fill)
+
+    async def _throttle(self, fill: FillRun | None = None) -> bool:
         while self.store.count_since(3600) >= self.max_per_hour:
-            await asyncio.sleep(30)
+            if not await self._publication_wait(30, fill):
+                return False
         gap = time.time() - (self.store.last_post_ts() or 0)
         if gap < self.cfg.min_interval:
-            await asyncio.sleep(self.cfg.min_interval - gap)
+            if not await self._publication_wait(self.cfg.min_interval - gap, fill):
+                return False
+        return True
 
-    async def publish(self, payload: dict) -> bool:
+    async def publish(self, payload: dict, *, fill: FillRun | None = None) -> bool:
         async with self.publish_lock:
-            return await self._publish(payload)
+            return await self._publish(payload, fill=fill)
 
-    async def _publish(self, payload: dict) -> bool:
+    async def _publish(self, payload: dict, *, fill: FillRun | None = None) -> bool:
+        if fill is not None and not self._fill_allowed(fill):
+            return False
         if self.paused or not self.source_allowed(bool(payload.get("web")), payload["chat_id"], payload.get("origin", "")):
             await self.notify("Publicação cancelada: bot em pausa ou fonte já não autorizada.")
             return False
@@ -491,7 +534,8 @@ class App:
                 await self.notify("⚠️ A mensagem original já não existe. Não publiquei.")
                 return False
         if not payload.get("test"):
-            await self._throttle()
+            if not await self._throttle(fill):
+                return False
         # Recheck after sleeping: pause/removal can happen while queued.
         if self.paused or dest != self.s("dest") or not self.source_allowed(web, payload["chat_id"], payload.get("origin", "")):
             return False
@@ -500,6 +544,10 @@ class App:
         ents = [MessageEntityCustomEmoji(o, l, d) for o, l, d in spec] or None
         sender = self.bot if web else self.client
         for attempt in (1, 2):
+            if (self.paused or dest != self.s("dest")
+                    or not self.source_allowed(web, payload["chat_id"], payload.get("origin", ""))
+                    or (fill is not None and not self._fill_allowed(fill))):
+                return False
             try:
                 if web:
                     if photo:
@@ -516,7 +564,8 @@ class App:
                 if attempt == 2:
                     await self.notify(f"⚠️ Telegram pediu para esperar {e.seconds}s. Não publiquei.")
                     return False
-                await asyncio.sleep(e.seconds + 1)
+                if not await self._publication_wait(e.seconds + 1, fill):
+                    return False
             except Exception as e:
                 log.exception("Falhou a publicar")
                 await self.notify(
@@ -729,6 +778,8 @@ class App:
         ]
         if sem_modelo:
             lines.append(f"⚠️ Falta o link modelo de: {', '.join(sem_modelo)} (/linkmodelo)")
+        if self.fill_run:
+            lines.append(f"Enchimento: {self.fill_run.published}/{self.fill_run.target} · {self.fill_run.phase}")
         await event.respond("\n".join(lines), parse_mode="html", buttons=self.main_buttons())
 
     async def cmd_exemplo(self, event, arg):
@@ -742,6 +793,164 @@ class App:
         n = int(arg) if arg.isdigit() else 5
         await event.respond("🧪 A obter as últimas ofertas (sem link)…")
         await self.force_recent(n, nolink=True)
+
+    async def cmd_encher(self, event, arg):
+        if arg and arg != "50":
+            await event.respond("Uso: /encher (50 publicações por execução).")
+            return
+        if self.fill_task and not self.fill_task.done():
+            await event.respond("Já há um enchimento em curso. Usa /encher_estado ou /encher_parar.")
+            return
+        if self.paused:
+            await event.respond("O bot está em pausa. Usa /retomar antes de /encher.")
+            return
+        if not self.s("dest") or not self.n_sources():
+            await event.respond("Configura primeiro /destino e as fontes (/adicionar ou /escolher).")
+            return
+        if self.s("hacoo_generator", False):
+            try:
+                self.hacoo.vault.load(self.owner)
+            except HacooError as exc:
+                await event.respond(str(exc))
+                return
+        run = FillRun(destination=self.s("dest"))
+        self.fill_run = run
+        await event.respond(
+            "▶️ Vou publicar 50 ofertas diretamente no destino atual, com tradução e links convertidos. "
+            "Misturo as fontes e posso reutilizar ofertas antigas, sem repetir produtos neste lote. "
+            f"Respeito o limite de {self.max_per_hour}/hora e o intervalo de {self.cfg.min_interval}s. "
+            "Consulta /encher_estado; /encher_parar interrompe."
+        )
+        # Do not hold the command lock while fetching/converting/throttling.
+        self.fill_task = asyncio.create_task(self._run_fill(run), name="encher-canal")
+
+    async def cmd_encher_estado(self, event, arg):
+        run = self.fill_run
+        if run is None:
+            await event.respond("Ainda não há uma execução nesta sessão. Usa /encher.")
+            return
+        await event.respond(
+            f"Enchimento: {run.phase}. Publicadas: {run.published}/{run.target}. "
+            f"Candidatas tentadas: {run.attempted}; não publicadas: {run.skipped}; "
+            f"falhas na leitura de fontes: {run.source_errors}. "
+            f"Limite atual: {self.max_per_hour}/hora."
+        )
+
+    async def cmd_encher_parar(self, event, arg):
+        if not self.fill_task or self.fill_task.done():
+            await event.respond("Não há enchimento em curso.")
+            return
+        self.fill_run.stop.set()
+        await event.respond("Paragem pedida. Termino a operação em curso e não inicio outra publicação do lote.")
+
+    async def _fill_candidates(self, run: FillRun) -> dict[str, list[Job]]:
+        """Bounded history scan, without moving live poller cursors or pending items."""
+        candidates: dict[str, list[Job]] = {}
+        if self.web:
+            # Resolve the destination to avoid filling from our own public channel.
+            dest = await self.bot.get_entity(run.destination)
+            destination_name = (getattr(dest, "username", None) or "").casefold()
+            names = list(dict.fromkeys(self.web_sources))
+            random.shuffle(names)
+            for name in names:
+                if not self._fill_allowed(run):
+                    break
+                if name.casefold() == destination_name:
+                    continue
+                jobs, seen, before = [], set(), None
+                for page in range(15):  # At most 300 posts / 15 pages per source.
+                    if not self._fill_allowed(run) or name not in self.web_sources:
+                        break
+                    try:
+                        posts = await webfeed.fetch(self.http, name, before=before)
+                    except Exception:
+                        run.source_errors += 1
+                        break
+                    fresh = [p for p in posts if p.id not in seen and (before is None or p.id < before)]
+                    if not fresh:
+                        break  # Exhausted, repeated page, or ignored pagination cursor.
+                    fresh.sort(key=lambda p: p.id, reverse=True)
+                    fresh = fresh[:300 - len(seen)]
+                    for post in fresh:
+                        seen.add(post.id)
+                        if self.cfg.require_photo and not post.photo_url:
+                            continue
+                        offer = parse(post.text, post.urls)
+                        if offer:
+                            jobs.append(Job(0, post.id, offer, post.photo_url, True, f"https://t.me/{name}/{post.id}"))
+                    if len(seen) >= 300:
+                        break
+                    before = min(p.id for p in fresh)
+                    if page < 14 and not await self._publication_wait(1, run):
+                        break
+                if jobs:
+                    candidates[name] = jobs
+        else:
+            sources = [s for s in self.store.list_sources() if s.active and s.chat_id != run.destination]
+            random.shuffle(sources)
+            for source in sources:
+                if not self._fill_allowed(run):
+                    break
+                try:
+                    messages = await self.client.get_messages(source.chat_id, limit=300)
+                except Exception:
+                    run.source_errors += 1
+                    continue
+                jobs = []
+                for message in messages:
+                    if source.topic_id and topic_of(message) != source.topic_id:
+                        continue
+                    if self.cfg.require_photo and not message.photo:
+                        continue
+                    offer = parse(message.raw_text or "", collect_urls(message))
+                    if offer:
+                        jobs.append(Job(source.chat_id, message.id, offer))
+                if jobs:
+                    candidates[str(source.chat_id)] = jobs
+        return candidates
+
+    async def _run_fill(self, run: FillRun):
+        try:
+            candidates = await self._fill_candidates(run)
+            if self._fill_allowed(run):
+                run.phase = "a publicar (respeitando os limites)"
+                await self.notify(
+                    f"📦 Recolhi {sum(map(len, candidates.values()))} ofertas em {len(candidates)} fontes. "
+                    f"Vou tentar publicar {run.target}, sem repetir produtos neste lote."
+                )
+            for job in interleave(candidates):
+                if not self._fill_allowed(run) or run.published >= run.target:
+                    break
+                run.attempted += 1
+                try:
+                    reason = await self.process(job, fill=run)
+                except Exception:
+                    reason = "Falha a preparar a oferta."
+                    log.warning("Falhou uma candidata do enchimento")
+                if reason:
+                    run.skipped += 1
+                elif run.published % 10 == 0:
+                    await self.notify(f"📦 Enchimento: {run.published}/{run.target} publicadas.")
+                await asyncio.sleep(0)  # Allow stop/status commands between fast operations.
+            if run.published >= run.target:
+                run.phase = "concluído"
+            elif not self._fill_allowed(run):
+                run.phase = "interrompido"
+            else:
+                run.phase = "terminado: esgotaram-se as ofertas válidas recolhidas"
+        except asyncio.CancelledError:
+            run.phase = "interrompido pelo encerramento do bot"
+            run.stop.set()
+            raise
+        except Exception:
+            run.phase = "terminado com erro na leitura ou preparação"
+            run.stop.set()
+            log.warning("Falhou o enchimento do canal")
+        await self.notify(
+            f"📦 Enchimento {run.phase}: <b>{run.published}/{run.target}</b> publicadas. "
+            f"Não publicadas: {run.skipped}; falhas na leitura de fontes: {run.source_errors}. "
+            "Podes iniciar outro lote com /encher."
+        )
 
     async def force_recent(self, n: int = 5, nolink: bool = False) -> None:
         """Mostra as n ofertas mais recentes da origem, ignorando 'só novas' e o
@@ -828,6 +1037,8 @@ class App:
 
     async def cmd_pausar(self, event, arg):
         self.store.set("paused", True)
+        if self.fill_run:
+            self.fill_run.stop.set()
         await event.respond("⏸ Em pausa. Não leio nem publico até /retomar.")
 
     async def cmd_retomar(self, event, arg):
