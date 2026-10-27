@@ -47,6 +47,68 @@ Outros comandos: `/estado` `/ultimas` `/pausar` `/retomar` `/limite N` `/fontes`
 
 ### Como converte o link
 
+Há dois métodos: o modelo existente (por omissão) e o **gerador Hacoo autenticado**.
+Depois de `/hacoo_login` concluído, as ofertas Hacoo passam pelo formulário oficial
+`https://affiliate.hacoo.app/en-GB/promotion/link`. O bot remove os parâmetros do
+afiliado original, submete o produto e lê o link gerado na janela «Promote Link».
+Não altera identificadores nem inventa links quando o gerador falha.
+
+#### Ativar o gerador Hacoo
+
+1. Atualiza e reconstrói a imagem: `botctl update` (ou `docker compose build`).
+   A imagem inclui Chromium e as suas dependências; a primeira construção demora mais.
+2. Na pasta instalada, executa `botctl hacoo-key`. Gera `HACOO_SESSION_KEY` no
+   `.env`, sem a mostrar, e recria o contentor. Não substitui uma chave já configurada.
+   Numa instalação sem `botctl`, gera uma chave Fernet com o comando de `.env.example`,
+   guarda-a em `HACOO_SESSION_KEY` e recria o contentor.
+3. Abre o **chat privado** do bot como dono (`OWNER_ID`) e envia `/hacoo_login`,
+   sem credenciais no comando. Responde com o email e depois a palavra-passe.
+   Tens 3 minutos; `/cancelar` interrompe o pedido.
+4. Usa `/hacoo_estado` e `/exemplo` para rever os links. O modo manual mantém-se
+   até selecionares `/auto`. Usa apenas fontes cuja leitura e republicação autorizaste.
+
+Comandos adicionais:
+
+- `/hacoo_sair`: apaga a sessão local e fecha o navegador. Não revoga sessões
+  noutros dispositivos. O modo gerador mantém-se e exige novo login.
+- `/hacoo_modelo`: regressa explicitamente ao método `/linkmodelo`.
+- `/hacoo_estado`: indica o método e a disponibilidade local da sessão; a validade
+  no servidor Hacoo é confirmada na próxima conversão.
+
+**Segurança:** todos os comandos de controlo e credenciais são aceites apenas
+do dono, em privado. As mensagens de credenciais são apagadas antes de serem usadas;
+se o Telegram não permitir apagar, o login é cancelado. Isto não elimina cópias em
+notificações ou no serviço Telegram: chats com bots não têm encriptação ponta a ponta.
+A palavra-passe não é guardada em ficheiros, SQLite ou logs. Email e palavra-passe
+são usados apenas no login. A sessão fica cifrada e autenticada com Fernet em
+`data/hacoo-session.enc`, associada ao dono, e expira localmente ao fim de 7 dias
+(a Hacoo pode expirá-la antes). Reiniciar o bot recupera a sessão cifrada; não há
+relogin automático com uma palavra-passe armazenada. `/hacoo_login` volta a pedi-la.
+
+Protege `.env` e `data/`, restringe o acesso ao servidor e cifra os backups:
+`botctl backup` inclui tanto a sessão como a chave em `.env`, permitindo decifrá-la.
+Mudar ou perder a chave exige novo login. Não atives logs de depuração do Playwright,
+tracing ou gravações do navegador em produção: podem conter credenciais.
+
+**Tempo real:** em `MODE=account`, as mensagens novas das fontes escolhidas entram
+imediatamente na fila. A publicação depende do tempo de conversão, da aprovação
+manual/automática e dos limites `/limite` e `MIN_INTERVAL_SEC`. Em `MODE=web`,
+mantém-se a consulta periódica (120 segundos por omissão). Falhas de conversão
+avisam o dono e não publicam; podes voltar a tentar com `/exemplo`.
+As fontes são verificadas novamente ao processar e antes de publicar. Pausar o bot
+ou remover uma fonte impede as publicações ainda pendentes dessa fonte.
+
+**Validação e limites:** os seletores do login foram confirmados no site público
+em 27/10/2026 e os do gerador no código público Hacoo. Testes automatizados simulam
+login, sessão e conversão num Chromium real, sem contactar contas reais.
+Ainda é necessário validar uma conversão com uma conta de afiliado autorizada.
+CAPTCHA, MFA, conta não aprovada, bloqueio ou alterações do site interrompem o fluxo;
+o bot não contorna essas verificações. Apenas login por email/palavra-passe é suportado.
+Domínios de produtos permitidos: `hacoo.app`, `hacoo.pl`, `hacoo.com` e subdomínios;
+os resultados também podem usar `onlyaff.app`. Outros domínios exigem revisão do código.
+
+#### Método de modelo (existente)
+
 1. Segue o link da mensagem (incluindo encurtadores como onlyaff.app) até chegar à loja.
 2. Extrai o ID do produto.
 3. Monta o **teu** link a partir do modelo que guardaste com `/linkmodelo` (só muda o ID do produto).
@@ -82,3 +144,17 @@ Confirma que as regras do canal de origem e do programa de afiliados permitem re
 - Modo web: só canais públicos com pré-visualização web; só a primeira foto de cada mensagem; sem emojis premium.
 - Redirecionamentos feitos só por JavaScript complexo não são seguidos (HTTP, `meta refresh` e `location=` simples sim).
 - Canais com "restringir guardar conteúdo" podem impedir a cópia da imagem no modo account.
+
+## Testes de desenvolvimento
+
+```bash
+python -m pip install -r requirements.txt pytest
+python -m pytest -q
+# Opcional: teste do adaptador com Chromium e páginas simuladas (sem conta real)
+python -m playwright install chromium
+HACOO_BROWSER_TESTS=1 python -m pytest -q
+```
+
+Os testes não enviam mensagens reais nem usam segredos. O teste do navegador é
+omitido quando `HACOO_BROWSER_TESTS` não está definido. O Docker de produção continua
+sem portas expostas e com o utilizador sem privilégios existente.

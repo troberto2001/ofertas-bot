@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -38,6 +38,7 @@ class Config:
     require_photo: bool
     mode: str = "web"          # "web" = sem conta (canal público) | "account" = com conta
     web_poll_sec: int = 120
+    hacoo_session_key: str = field(default="", repr=False)
 
     @property
     def user_session(self) -> str:
@@ -95,4 +96,5 @@ class Config:
             require_photo=_bool("REQUIRE_PHOTO", True),
             mode=mode,
             web_poll_sec=max(60, _int("WEB_POLL_SEC", 120)),
+            hacoo_session_key=os.environ.get("HACOO_SESSION_KEY", "").strip(),
         )

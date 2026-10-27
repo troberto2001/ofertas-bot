@@ -31,6 +31,7 @@ from telethon.tl.types import MessageEntityCustomEmoji
 
 from . import links, render, webfeed
 from .config import Config
+from .hacoo import HacooError, HacooGenerator, SessionVault
 from .links import UA
 from .parser import Offer, find_urls, parse
 from .store import Store
@@ -52,6 +53,10 @@ AJUDA = """<b>Comandos</b>
 /codigo CODIGO – muda o teu código de desconto
 /modelo – ver/mudar o modelo da mensagem
 /linkmodelo LINK – cola um link teu da loja (gerado na tua conta)
+/hacoo_login – ligar o gerador Hacoo (email e palavra-passe, só em privado)
+/hacoo_estado · /hacoo_sair – ver sessão / apagar sessão local
+/hacoo_modelo – voltar explicitamente ao método /linkmodelo
+/cancelar – cancelar o pedido de credenciais
 /limite N – máximo de publicações por hora
 
 <b>Origem e destino</b>
@@ -119,6 +124,14 @@ class App:
         self.warned_template = False
         self.web_fail: dict[str, int] = {}
         self.started = time.time()
+        self.hacoo = HacooGenerator(SessionVault(cfg.data_dir / "hacoo-session.enc", cfg.hacoo_session_key))
+        self.hacoo_step = None
+        self.hacoo_email = None
+        self.hacoo_deadline = 0.0
+        self.hacoo_timer = None
+        self.command_lock = asyncio.Lock()
+        self.process_lock = asyncio.Lock()
+        self.publish_lock = asyncio.Lock()
 
     # ---------- definições ----------
     def s(self, key: str, default=None):
@@ -199,7 +212,12 @@ class App:
         )
         await self.notify(f"🤖 Bot iniciado.\n{extra}\nEnvia /estado ou /ajuda.")
         tasks += [self.worker(), self.idle_monitor(), self.bot.run_until_disconnected()]
-        await asyncio.gather(*tasks)
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            self._cancel_hacoo_login()
+            await self.hacoo.close()
+            await self.http.aclose()
 
     # ---------- leitura: modo conta ----------
     async def on_source_message(self, event) -> None:
@@ -300,9 +318,15 @@ class App:
         return text
 
     async def process(self, job: Job, force: bool = False, nolink: bool = False) -> str | None:
+        async with self.process_lock:
+            return await self._process(job, force, nolink)
+
+    async def _process(self, job: Job, force: bool = False, nolink: bool = False) -> str | None:
         """Converte e publica/envia para aprovação. Devolve o motivo se não avançou.
         force=True: ignora o anti-duplicados e envia sempre para aprovação manual.
         nolink=True (teste): não converte o link; mostra a oferta sem a linha do link."""
+        if not force and (self.paused or not self.source_allowed(job.web, job.chat_id, job.origin)):
+            return None
         if nolink:
             await self._preview_nolink(job)
             return None
@@ -332,7 +356,16 @@ class App:
                 f"⚠️ O formato do link da loja <b>{rule.name}</b> mudou (não encontro o ID do produto). "
                 f"<b>Não publiquei.</b>\n{html.escape(final)}\nOrigem: {origem}",
             )
-        link = links.build_link(rule, pid, final)
+        key = f"{rule.name}:{pid}"
+        if not force and (self.store.was_posted(key, self.cfg.dedup_hours) or self.store.has_pending_key(key)):
+            return None
+        if rule.name == "hacoo" and self.s("hacoo_generator", False):
+            try:
+                link = await self.hacoo.convert(self.owner, final)
+            except HacooError as exc:
+                return await self._fail(force, "⚠️ " + html.escape(str(exc)) + " Não publiquei.")
+        else:
+            link = links.build_link(rule, pid, final)
         if not link:
             msg = (
                 "⚠️ Ainda não tenho o teu link de afiliado da loja "
@@ -413,6 +446,12 @@ class App:
             )
 
     # ---------- publicar ----------
+    def source_allowed(self, web: bool, chat_id: int, origin: str) -> bool:
+        if web:
+            return any(origin.startswith(f"https://t.me/{name}/") for name in self.web_sources)
+        src = self.store.get_source(chat_id)
+        return bool(src and src.active and chat_id != self.s("dest"))
+
     async def _throttle(self) -> None:
         while self.store.count_since(3600) >= self.max_per_hour:
             await asyncio.sleep(30)
@@ -421,6 +460,13 @@ class App:
             await asyncio.sleep(self.cfg.min_interval - gap)
 
     async def publish(self, payload: dict) -> bool:
+        async with self.publish_lock:
+            return await self._publish(payload)
+
+    async def _publish(self, payload: dict) -> bool:
+        if self.paused or not self.source_allowed(bool(payload.get("web")), payload["chat_id"], payload.get("origin", "")):
+            await self.notify("Publicação cancelada: bot em pausa ou fonte já não autorizada.")
+            return False
         dest = self.s("dest")
         if not dest:
             await self.notify("⚠️ Falta escolher o canal de destino: /destino @canal")
@@ -441,6 +487,9 @@ class App:
                 return False
         if not payload.get("test"):
             await self._throttle()
+        # Recheck after sleeping: pause/removal can happen while queued.
+        if self.paused or dest != self.s("dest") or not self.source_allowed(web, payload["chat_id"], payload.get("origin", "")):
+            return False
         premium = False if web else self.premium
         text, spec = render.render(self.template, payload["values"], premium=premium)
         ents = [MessageEntityCustomEmoji(o, l, d) for o, l, d in spec] or None
@@ -498,6 +547,16 @@ class App:
 
     # ---------- comandos ----------
     async def on_command(self, event) -> None:
+        # Check here too: callers and future handlers must not bypass privacy.
+        if event.sender_id != self.owner or not event.is_private:
+            return
+        async with self.command_lock:
+            if self.hacoo_step:
+                await self._receive_hacoo_credential(event)
+                return
+            await self._dispatch_command(event)
+
+    async def _dispatch_command(self, event) -> None:
         text = (event.raw_text or "").strip()
         try:
             if text.startswith("/"):
@@ -517,6 +576,107 @@ class App:
             log.exception("Erro num comando")
             await event.respond(f"⚠️ Erro: {e}")
 
+    def _cancel_hacoo_login(self):
+        if self.hacoo_timer:
+            self.hacoo_timer.cancel()
+        self.hacoo_timer = self.hacoo_step = self.hacoo_email = None
+        self.hacoo_deadline = 0.0
+
+    async def cmd_cancelar(self, event, arg):
+        self._cancel_hacoo_login()
+        self.awaiting = None
+        await event.respond("Pedido cancelado.")
+
+    async def cmd_hacoo_login(self, event, arg):
+        if arg:
+            await event.delete()
+            await event.respond("Não coloques credenciais no comando. Envia apenas /hacoo_login.")
+            return
+        try:
+            self.hacoo.vault.require_key()
+        except HacooError as exc:
+            await event.respond(str(exc))
+            return
+        self._cancel_hacoo_login()
+        self.hacoo_step = "email"
+        self.hacoo_deadline = time.monotonic() + 180
+        self.hacoo_timer = asyncio.get_running_loop().call_later(180, self._expire_hacoo_login)
+        await event.respond(
+            "Envia o email da tua conta Hacoo neste chat privado. Tens 3 minutos para concluir. "
+            "O bot tentará apagar as mensagens com credenciais antes de as usar; "
+            "os chats com bots não têm encriptação ponta a ponta. "
+            "A palavra-passe não será guardada. /cancelar interrompe o pedido."
+        )
+
+    def _expire_hacoo_login(self):
+        # Keep a sentinel so a late password is deleted, never treated as a command.
+        self.hacoo_email = None
+        self.hacoo_step = "expired"
+        self.hacoo_timer = None
+
+    async def _receive_hacoo_credential(self, event):
+        # No exceptions with credential-bearing objects may reach the generic logger.
+        try:
+            await event.delete()
+        except Exception:
+            self._cancel_hacoo_login()
+            await event.respond("Não consegui apagar a mensagem com credenciais. Apaga-a manualmente. Login cancelado; não usei as credenciais.")
+            return
+        raw = event.raw_text or ""
+        if raw.strip() == "/cancelar":
+            self._cancel_hacoo_login()
+            await event.respond("Pedido cancelado.")
+            return
+        if time.monotonic() > self.hacoo_deadline:
+            self._cancel_hacoo_login()
+            await event.respond("Pedido expirado. Recomeça com /hacoo_login.")
+            return
+        if getattr(event.message, "fwd_from", None):
+            self._cancel_hacoo_login()
+            await event.respond("Não aceito credenciais reencaminhadas. Recomeça com /hacoo_login.")
+            return
+        if self.hacoo_step == "email":
+            if len(raw) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", raw.strip()):
+                await event.respond("Email inválido. Envia novamente o email, ou /cancelar.")
+                return
+            self.hacoo_email, self.hacoo_step = raw.strip(), "password"
+            await event.respond("Envia agora a palavra-passe Hacoo (ou /cancelar).")
+            return
+        email = self.hacoo_email
+        self._cancel_hacoo_login()
+        if not raw or len(raw) > 1024:
+            await event.respond("Palavra-passe vazia ou demasiado longa. Recomeça com /hacoo_login.")
+            return
+        # Once chosen, never fall back silently to an old affiliate template.
+        self.store.set("hacoo_generator", True)
+        try:
+            await self.hacoo.login(self.owner, email, raw)
+        except HacooError as exc:
+            await event.respond(str(exc))
+        except Exception:
+            await event.respond("Não foi possível guardar a sessão Hacoo. Verifica a configuração do servidor.")
+        else:
+            await event.respond("✅ Sessão Hacoo guardada cifrada. Gerador ativo; usa /exemplo para rever uma oferta antes de /auto.")
+        finally:
+            raw = email = None
+
+    async def cmd_hacoo_estado(self, event, arg):
+        mode = "gerador" if self.s("hacoo_generator", False) else "modelo"
+        try:
+            self.hacoo.vault.load(self.owner)
+            status = "sessão local disponível (validada no site na próxima conversão)"
+        except HacooError as exc:
+            status = str(exc)
+        await event.respond(f"Hacoo: {mode}. {status}")
+
+    async def cmd_hacoo_sair(self, event, arg):
+        await self.hacoo.logout()
+        await event.respond("Sessão Hacoo apagada deste servidor. O modo gerador mantém-se: não converto até novo /hacoo_login. Para revogar outras sessões, usa o site Hacoo.")
+
+    async def cmd_hacoo_modelo(self, event, arg):
+        self.store.set("hacoo_generator", False)
+        await event.respond("Método de modelo selecionado explicitamente. Configura /linkmodelo com um link da tua conta.")
+
     @staticmethod
     def main_buttons():
         return [
@@ -532,7 +692,7 @@ class App:
     async def cmd_estado(self, event, arg):
         dest = self.s("dest_title") or ("não definido" if not self.s("dest") else str(self.s("dest")))
         rules = links.load_rules(self.cfg.rules_path)
-        sem_modelo = [r.name for r in rules if not r.template]
+        sem_modelo = [r.name for r in rules if not r.template and not (r.name == "hacoo" and self.s("hacoo_generator", False))]
         last = self.store.last_post_ts()
         ultima = datetime.fromtimestamp(last).strftime("%d/%m %H:%M") if last else "—"
         lines = [
@@ -543,6 +703,7 @@ class App:
             (f"Verificação do canal a cada ~{self.cfg.web_poll_sec}s" if self.web else f"Premium: {'sim' if self.premium else 'não'}"),
             f"Últimas 24h: {self.store.count_since(86400)} publicações · última: {ultima}",
             f"Por aprovar: {self.store.count_pending()} · limite/hora: {self.max_per_hour}",
+            "Hacoo: " + ("gerador (/hacoo_estado)" if self.s("hacoo_generator", False) else "modelo (/hacoo_login para ligar o gerador)"),
         ]
         if sem_modelo:
             lines.append(f"⚠️ Falta o link modelo de: {', '.join(sem_modelo)} (/linkmodelo)")
@@ -952,7 +1113,7 @@ class App:
 
     # ---------- botões ----------
     async def on_button(self, event) -> None:
-        if event.sender_id != self.owner:
+        if event.sender_id != self.owner or event.chat_id != self.owner:
             await event.answer("Sem permissão.", alert=True)
             return
         data = event.data.decode()

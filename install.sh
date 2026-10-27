@@ -42,7 +42,7 @@ systemctl enable --now docker >/dev/null 2>&1 || true
 # ---- 3. copiar ficheiros ----
 say "A instalar em $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR/data"
-for f in app requirements.txt Dockerfile docker-compose.yml botctl.sh README.md; do
+for f in app requirements.txt Dockerfile .dockerignore docker-compose.yml botctl.sh README.md; do
   [ -e "$SRC_DIR/$f" ] || die "Falta o ficheiro $f em $SRC_DIR"
   rm -rf "${INSTALL_DIR:?}/$f"
   cp -a "$SRC_DIR/$f" "$INSTALL_DIR/$f"
