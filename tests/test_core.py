@@ -214,3 +214,4 @@ def test_store_dedup_pending_sources():
 
         s.set("mode", "auto")
         assert s.get("mode") == "auto" and s.get("x", 3) == 3
+        s.db.close()  # Release the temporary database before cleanup on Windows.

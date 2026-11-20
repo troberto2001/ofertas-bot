@@ -20,10 +20,25 @@ case "${1:-help}" in
   login)    c stop || true
             c run --rm -it bot python -m app.login
             c up -d ;;
+  hacoo-key)
+            # Generate once, without displaying the key or overwriting an existing one.
+            if grep -Eq '^HACOO_SESSION_KEY=.+$' .env; then
+              echo "Já existe uma chave Hacoo. Não foi alterada."
+              exit 0
+            fi
+            umask 077
+            hacoo_key="$(c run --rm --no-deps -T bot python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+            [[ "$hacoo_key" =~ ^[A-Za-z0-9_-]{43}=$ ]] || { echo "Falhou a geração da chave."; exit 1; }
+            sed -i '/^HACOO_SESSION_KEY=/d' .env
+            printf '\nHACOO_SESSION_KEY=%s\n' "$hacoo_key" >> .env
+            unset hacoo_key
+            chmod 600 .env
+            c up -d --force-recreate
+            echo "Chave guardada em .env. No chat privado do bot, usa /hacoo_login." ;;
   backup)   out="$DIR/backup-$(date +%Y%m%d-%H%M).tar.gz"
             tar -czf "$out" -C "$DIR" data .env
             chmod 600 "$out"
-            echo "Backup: $out  (contém a sessão do Telegram: guarda-o em segurança)" ;;
+            echo "Backup: $out  (contém sessões Telegram/Hacoo e a chave de cifra: guarda-o em segurança)" ;;
   uninstall)
             c down
             if [ "${2:-}" = "--purge" ]; then
@@ -38,6 +53,7 @@ botctl logs        log em direto (Ctrl+C para sair)
 botctl start|stop|restart
 botctl update      reconstruir depois de alterar o código
 botctl login       refazer o login do Telegram
+botctl hacoo-key   gerar a chave Hacoo uma vez e recriar o contentor
 botctl backup      copia de segurança de data/ e .env
 botctl uninstall [--purge]
 TXT

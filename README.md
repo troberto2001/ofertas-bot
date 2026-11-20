@@ -1,4 +1,3 @@
-# Bot de ofertas (Telegram)
 
 Lê ofertas de um canal, troca o código de desconto e o link pelo teu, copia a imagem e publica no teu canal. Corre num contentor Docker no teu VPS.
 
