@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import tempfile
@@ -16,6 +17,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
+
+log = logging.getLogger("ofertas.hacoo")
 
 ORIGIN = "https://affiliate.hacoo.app"
 GENERATOR = ORIGIN + "/en-GB/promotion/link"
@@ -28,6 +31,13 @@ OUTPUT = '[role="dialog"] textarea[readonly]'
 
 class HacooError(Exception):
     """Only fixed, safe messages may cross this boundary."""
+
+
+class _Transient(Exception):
+    """Falha do browser: guarda só a fase e o TIPO do erro, nunca a mensagem (pode ter dados)."""
+    def __init__(self, step: str, kind: str):
+        super().__init__(step)
+        self.step, self.kind = step, kind
 
 
 class LoginRequired(HacooError):
@@ -115,10 +125,15 @@ class SessionVault:
 
 
 class HacooGenerator:
-    def __init__(self, vault: SessionVault):
+    def __init__(self, vault: SessionVault, credentials: tuple[str, str] | None = None):
         self.vault = vault
+        self._credentials = credentials  # só em memória; vêm do .env do servidor (opcional)
         self.lock = asyncio.Lock()
         self._pw = self._browser = None
+
+    @property
+    def auto_login(self) -> bool:
+        return self._credentials is not None
 
     @asynccontextmanager
     async def _page(self, state=None):
@@ -156,43 +171,81 @@ class HacooGenerator:
     async def login(self, owner: int, email: str, password: str):
         self.vault.require_key()
         async with self.lock:
-            try:
-                async with asyncio.timeout(90), self._page() as (page, context):
-                    await page.goto(SIGN_IN, wait_until="domcontentloaded")
-                    await page.get_by_placeholder("Email", exact=True).wait_for(state="visible")
-                    self._check_origin(page)
-                    await page.get_by_placeholder("Email", exact=True).fill(email)
-                    await page.get_by_placeholder("Password", exact=True).fill(password)
-                    await page.get_by_role("tabpanel").get_by_role("button", name="Sign In", exact=True).click()
-                    await page.get_by_placeholder("Password", exact=True).wait_for(state="hidden")
-                    await self._open_generator(page)
-                    self.vault.save(owner, await context.storage_state())
-            except HacooError:
-                raise
-            except Exception:
-                raise HacooError("Login Hacoo não concluído. Verifica as credenciais e o acesso ao programa; se houver verificação adicional, conclui-a no site.") from None
+            await self._login_locked(owner, email, password)
+
+    async def _login_locked(self, owner: int, email: str, password: str):
+        try:
+            async with asyncio.timeout(90), self._page() as (page, context):
+                await page.goto(SIGN_IN, wait_until="domcontentloaded")
+                await page.get_by_placeholder("Email", exact=True).wait_for(state="visible")
+                self._check_origin(page)
+                await page.get_by_placeholder("Email", exact=True).fill(email)
+                await page.get_by_placeholder("Password", exact=True).fill(password)
+                await page.get_by_role("tabpanel").get_by_role("button", name="Sign In", exact=True).click()
+                await page.get_by_placeholder("Password", exact=True).wait_for(state="hidden")
+                await self._open_generator(page)
+                self.vault.save(owner, await context.storage_state())
+        except HacooError:
+            raise
+        except Exception:
+            raise HacooError("Login Hacoo não concluído. Verifica as credenciais e o acesso ao programa; se houver verificação adicional, conclui-a no site.") from None
 
     async def convert(self, owner: int, url: str) -> str:
         source = product_url(url)
         async with self.lock:
-            session = self.vault.load(owner)
-            try:
-                async with asyncio.timeout(75), self._page(session["state"]) as (page, context):
-                    await self._open_generator(page)
-                    await page.locator(INPUT).fill(source)
-                    await page.get_by_role("button", name="Create Link", exact=True).click()
-                    output = page.locator(OUTPUT)
-                    await output.wait_for(state="visible")
-                    result = result_url(await output.input_value(), source)
-                    self.vault.save(owner, await context.storage_state(), session["created"])
-                    return result
-            except LoginRequired:
-                self.vault.clear()
-                raise
-            except HacooError:
-                raise
-            except Exception:
-                raise HacooError("Conversão Hacoo falhou ou excedeu o tempo limite. Não publiquei; verifica /hacoo_estado ou volta a usar /hacoo_login.") from None
+            relogged = False
+            failures = 0
+            while True:
+                try:
+                    try:
+                        session = self.vault.load(owner)
+                    except LoginRequired:
+                        if self._credentials is None or relogged:
+                            raise
+                        relogged = True  # sem sessão guardada: autentica sozinho
+                        log.info("Hacoo: sem sessão válida, a autenticar automaticamente.")
+                        await self._login_locked(owner, *self._credentials)
+                        session = self.vault.load(owner)
+                    return await self._convert_once(owner, source, session)
+                except LoginRequired:
+                    self.vault.clear()
+                    if self._credentials is not None and not relogged:
+                        relogged = True  # o site recusou a sessão: autentica de novo e repete
+                        log.info("Hacoo: sessão recusada pelo site, a autenticar automaticamente.")
+                        await self._login_locked(owner, *self._credentials)
+                        continue
+                    raise
+                except HacooError:
+                    raise
+                except _Transient as exc:
+                    failures += 1
+                    log.warning("Hacoo: falha na fase '%s' (%s), tentativa %d de 2.", exc.step, exc.kind, failures)
+                    await self.close()  # a próxima tentativa usa um browser novo
+                    if failures >= 2:
+                        raise HacooError(
+                            f"Conversão Hacoo falhou ou excedeu o tempo limite (fase: {exc.step}). "
+                            "Não publiquei; verifica /hacoo_estado ou volta a usar /hacoo_login."
+                        ) from None
+
+    async def _convert_once(self, owner: int, source: str, session: dict) -> str:
+        step = "abrir o gerador"
+        try:
+            async with asyncio.timeout(75), self._page(session["state"]) as (page, context):
+                await self._open_generator(page)
+                step = "colar o link"
+                await page.locator(INPUT).fill(source)
+                step = "criar o link"
+                await page.get_by_role("button", name="Create Link", exact=True).click()
+                step = "ler o resultado"
+                output = page.locator(OUTPUT)
+                await output.wait_for(state="visible")
+                result = result_url(await output.input_value(), source)
+                self.vault.save(owner, await context.storage_state(), session["created"])
+                return result
+        except HacooError:
+            raise
+        except Exception as exc:
+            raise _Transient(step, type(exc).__name__) from None
 
     async def logout(self):
         async with self.lock:

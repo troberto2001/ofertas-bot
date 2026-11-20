@@ -58,6 +58,21 @@ Lojas: vêm definidas em `data/rules.json` (a Hacoo vem de origem). Para outra l
 
 Define `MODE=account` no `.env`, corre `botctl login` e, no pedido, escreve o **número de telemóvel** (nunca o token do BotFather: um bot não lê grupos). Depois usa `/escolher` e `/destino` (botões). Emojis premium: `/modelo` e envia a mensagem com os emojis.
 
+## Hacoo: autenticação automática (opcional)
+
+Por omissão a sessão da Hacoo faz-se uma vez com `/hacoo_login` (em privado) e fica guardada **cifrada** (`HACOO_SESSION_KEY`), sem guardar a palavra-passe. Quando expira, o bot avisa e é preciso repetir o `/hacoo_login`.
+
+Para o bot se autenticar **sozinho**, acrescenta ao `.env` **do servidor** (`nano /opt/ofertas-bot/.env`, nunca ao GitHub):
+
+```
+HACOO_EMAIL=o_teu_email
+HACOO_PASSWORD='a_tua_palavra_passe'
+```
+
+Depois `cd /opt/ofertas-bot && docker compose up -d --force-recreate`. Compromisso: a palavra-passe fica em texto no `.env` (ficheiro só legível pelo root). Se a Hacoo pedir verificação adicional (captcha ou código), não é possível automatizar: conclui-a no site.
+
+Quando uma conversão falha, o bot repete uma vez com um browser novo e, se a sessão tiver expirado, autentica-se e repete. Se falhar mesmo assim, avisa **no máximo uma vez a cada 30 minutos** e indica a fase em que falhou. O log (`botctl logs`) regista só a fase e o tipo de erro, nunca dados da conta.
+
 ## Reinício automático
 
 - Se o processo **cair**, o Docker volta a levantá-lo de imediato (`restart: unless-stopped`), e também depois de reiniciar o servidor.

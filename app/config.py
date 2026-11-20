@@ -39,6 +39,8 @@ class Config:
     mode: str = "web"          # "web" = sem conta (canal público) | "account" = com conta
     web_poll_sec: int = 120
     hacoo_session_key: str = field(default="", repr=False)
+    hacoo_email: str = field(default="", repr=False)
+    hacoo_password: str = field(default="", repr=False)
 
     @property
     def user_session(self) -> str:
@@ -97,4 +99,6 @@ class Config:
             mode=mode,
             web_poll_sec=max(60, _int("WEB_POLL_SEC", 120)),
             hacoo_session_key=os.environ.get("HACOO_SESSION_KEY", "").strip(),
+            hacoo_email=os.environ.get("HACOO_EMAIL", "").strip(),
+            hacoo_password=os.environ.get("HACOO_PASSWORD", "").strip("\r\n"),
         )

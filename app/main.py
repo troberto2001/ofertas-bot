@@ -39,6 +39,8 @@ from .watchdog import Watchdog
 
 log = logging.getLogger("ofertas")
 
+NOTICE_COOLDOWN_SEC = 1800  # o mesmo aviso de falha não se repete antes de 30 min
+
 AJUDA = """<b>Comandos</b>
 
 <b>Estado</b>
@@ -131,7 +133,9 @@ class App:
             web_expected=lambda: self.web and not self.paused and bool(self.web_sources),
             web_poll_sec=cfg.web_poll_sec,
         )
-        self.hacoo = HacooGenerator(SessionVault(cfg.data_dir / "hacoo-session.enc", cfg.hacoo_session_key))
+        creds = (cfg.hacoo_email, cfg.hacoo_password) if cfg.hacoo_email and cfg.hacoo_password else None
+        self.hacoo = HacooGenerator(SessionVault(cfg.data_dir / "hacoo-session.enc", cfg.hacoo_session_key), creds)
+        self._notice_at: dict[str, float] = {}
         self.hacoo_step = None
         self.hacoo_email = None
         self.hacoo_deadline = 0.0
@@ -327,7 +331,15 @@ class App:
     async def _fail(self, force: bool, text: str) -> str:
         """Em modo normal avisa o dono; em modo forçado devolve o texto para o resumo."""
         if not force:
-            await self.notify(text)
+            now = time.monotonic()
+            last = self._notice_at.get(text)
+            if last is None or now - last > NOTICE_COOLDOWN_SEC:
+                if len(self._notice_at) > 200:  # não deixar crescer sem limite
+                    self._notice_at = {k: v for k, v in self._notice_at.items() if now - v <= NOTICE_COOLDOWN_SEC}
+                self._notice_at[text] = now
+                await self.notify(text)
+            else:
+                log.info("Aviso repetido suprimido (máx. 1 igual a cada 30 min): %s", text[:80])
         return text
 
     async def process(self, job: Job, force: bool = False, nolink: bool = False) -> str | None:
@@ -680,7 +692,8 @@ class App:
             status = "sessão local disponível (validada no site na próxima conversão)"
         except HacooError as exc:
             status = str(exc)
-        await event.respond(f"Hacoo: {mode}. {status}")
+        auto = " Autenticação automática: ligada." if self.hacoo.auto_login else ""
+        await event.respond(f"Hacoo: {mode}. {status}{auto}")
 
     async def cmd_hacoo_sair(self, event, arg):
         await self.hacoo.logout()
