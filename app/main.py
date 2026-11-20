@@ -34,6 +34,7 @@ from .config import Config
 from .links import UA
 from .parser import Offer, find_urls, parse
 from .store import Store
+from .watchdog import Watchdog
 
 log = logging.getLogger("ofertas")
 
@@ -119,6 +120,12 @@ class App:
         self.warned_template = False
         self.web_fail: dict[str, int] = {}
         self.started = time.time()
+        self.watchdog = Watchdog(
+            cfg.data_dir / "heartbeat",
+            is_connected=self.bot.is_connected,
+            web_expected=lambda: self.web and not self.paused and bool(self.web_sources),
+            web_poll_sec=cfg.web_poll_sec,
+        )
 
     # ---------- definições ----------
     def s(self, key: str, default=None):
@@ -197,9 +204,16 @@ class App:
             if self.web
             else ("✅ Telegram Premium ativo." if self.premium else "ℹ️ Conta sem Premium: emojis premium viram emojis normais.")
         )
-        await self.notify(f"🤖 Bot iniciado.\n{extra}\nEnvia /estado ou /ajuda.")
-        tasks += [self.worker(), self.idle_monitor(), self.bot.run_until_disconnected()]
-        await asyncio.gather(*tasks)
+        crashed = self.store.get("running", False)  # ficou a 1 se o processo anterior não terminou bem
+        self.store.set("running", True)
+        aviso = "⚠️ Reiniciei sozinho (o arranque anterior não terminou bem).\n" if crashed else ""
+        await self.notify(f"🤖 Bot iniciado.\n{aviso}{extra}\nEnvia /estado ou /ajuda.")
+        self.watchdog.start_thread()
+        tasks += [self.worker(), self.idle_monitor(), self.watchdog.run(), self.bot.run_until_disconnected()]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            self.store.set("running", False)  # paragem limpa (ex.: botctl stop)
 
     # ---------- leitura: modo conta ----------
     async def on_source_message(self, event) -> None:
@@ -250,7 +264,7 @@ class App:
             if not self.paused:
                 for name in self.web_sources:
                     try:
-                        await self.poll_channel(name)
+                        await asyncio.wait_for(self.poll_channel(name), timeout=60)
                         self.web_fail[name] = 0
                     except Exception as e:
                         n = self.web_fail.get(name, 0) + 1
@@ -262,6 +276,7 @@ class App:
                                 f"{html.escape(str(e))}"
                             )
                     await asyncio.sleep(random.uniform(1, 4))
+            self.watchdog.web_cycle_done()
             await asyncio.sleep(self.cfg.web_poll_sec + random.uniform(0, 15))
 
     # ---------- processamento ----------

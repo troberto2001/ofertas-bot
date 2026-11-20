@@ -59,6 +59,12 @@ Lojas: vêm definidas em `data/rules.json` (a Hacoo vem de origem). Para outra l
 
 Define `MODE=account` no `.env`, corre `botctl login` e, no pedido, escreve o **número de telemóvel** (nunca o token do BotFather: um bot não lê grupos). Depois usa `/escolher` e `/destino` (botões). Emojis premium: `/modelo` e envia a mensagem com os emojis.
 
+## Reinício automático
+
+- Se o processo **cair**, o Docker volta a levantá-lo de imediato (`restart: unless-stopped`), e também depois de reiniciar o servidor.
+- Se ficar **preso** (processo vivo mas parado), um watchdog interno termina-o ao fim de 2 minutos e o Docker reinicia-o. Reinicia também se perder a ligação ao Telegram durante 5 minutos, ou (modo web) se deixar de conseguir ler os canais durante 15 minutos.
+- Depois de um reinício inesperado, o bot avisa-te no chat: "⚠️ Reiniciei sozinho". O `botctl status` mostra `(healthy)` quando está tudo bem.
+
 ## Gestão no servidor
 
 ```
