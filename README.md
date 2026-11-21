@@ -73,6 +73,10 @@ Depois `cd /opt/ofertas-bot && docker compose up -d --force-recreate`. Compromis
 
 Quando uma conversão falha, o bot repete uma vez com um browser novo e, se a sessão tiver expirado, autentica-se e repete. Se falhar mesmo assim, avisa **no máximo uma vez a cada 30 minutos** e indica a fase em que falhou. O log (`botctl logs`) regista só a fase e o tipo de erro, nunca dados da conta.
 
+### Verificar se a Hacoo está ligada e a converter
+
+O botão **🔎 Verificar Hacoo** (no `/start` e no `/estado`) ou `/hacoo_teste` faz uma conversão **real**, sem publicar nada, e diz-te: se a sessão está válida, se teve de se autenticar sozinho, quantas repetições fez, quanto demorou, o link gerado e, se falhar, a fase em que falhou. Usa a oferta mais recente da origem; ou `/hacoo_teste https://www.hacoo.pl/p/123` para um produto à tua escolha.
+
 ## Reinício automático
 
 - Se o processo **cair**, o Docker volta a levantá-lo de imediato (`restart: unless-stopped`), e também depois de reiniciar o servidor.

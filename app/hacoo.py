@@ -130,6 +130,7 @@ class HacooGenerator:
         self._credentials = credentials  # só em memória; vêm do .env do servidor (opcional)
         self.lock = asyncio.Lock()
         self._pw = self._browser = None
+        self.last_run: dict | None = None  # {'relogged': bool, 'retries': int} da última conversão
 
     @property
     def auto_login(self) -> bool:
@@ -206,7 +207,9 @@ class HacooGenerator:
                         log.info("Hacoo: sem sessão válida, a autenticar automaticamente.")
                         await self._login_locked(owner, *self._credentials)
                         session = self.vault.load(owner)
-                    return await self._convert_once(owner, source, session)
+                    result = await self._convert_once(owner, source, session)
+                    self.last_run = {"relogged": relogged, "retries": failures}
+                    return result
                 except LoginRequired:
                     self.vault.clear()
                     if self._credentials is not None and not relogged:

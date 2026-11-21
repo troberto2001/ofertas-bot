@@ -58,6 +58,7 @@ AJUDA = """<b>Comandos</b>
 /linkmodelo LINK – cola um link teu da loja (gerado na tua conta)
 /hacoo_login – ligar o gerador Hacoo (email e palavra-passe, só em privado)
 /hacoo_estado · /hacoo_sair – ver sessão / apagar sessão local
+/hacoo_teste – VERIFICAR: a conta Hacoo está ligada e a converter? (não publica nada; aceita um link)
 /hacoo_modelo – voltar explicitamente ao método /linkmodelo
 /cancelar – cancelar o pedido de credenciais
 /limite N – máximo de publicações por hora
@@ -695,6 +696,97 @@ class App:
         auto = " Autenticação automática: ligada." if self.hacoo.auto_login else ""
         await event.respond(f"Hacoo: {mode}. {status}{auto}")
 
+    async def cmd_hacoo_teste(self, event, arg):
+        await self.hacoo_check(arg)
+
+    async def _hacoo_test_product(self, link: str) -> tuple[str | None, str]:
+        """Escolhe o produto para o teste: o link dado, a oferta mais recente da origem,
+        ou a última publicada. Devolve (url_do_produto_hacoo | None, descrição/erro)."""
+        rules = links.load_rules(self.cfg.rules_path)
+        candidates: list[str] = []
+        origem = ""
+        if link:
+            candidates = find_urls(link)
+            origem = "o link que enviaste"
+            if not candidates:
+                return None, "Não percebi o link. Uso: /hacoo_teste https://www.hacoo.pl/p/123"
+        elif self.web:
+            for name in self.web_sources:
+                try:
+                    posts = await webfeed.fetch(self.http, name)
+                except Exception:
+                    continue
+                picked, _ = webfeed.recent_offers(posts, 1, False)
+                if picked:
+                    candidates, origem = picked[0][1].urls, f"a oferta mais recente de t.me/{name}"
+                    break
+        if not candidates:
+            rows = self.store.recent(1)
+            if rows and str(rows[0]["key"]).startswith("hacoo:"):
+                pid = str(rows[0]["key"]).split(":", 1)[1]
+                return f"https://www.hacoo.pl/p/{pid}", "o último produto que publiquei"
+            return None, "Não tenho nenhum produto para testar. Envia: /hacoo_teste https://www.hacoo.pl/p/123"
+        for u in candidates:
+            try:
+                final = await links.resolve(u, rules, self.http)
+            except Exception:
+                continue
+            r = links.match_rule(final, rules)
+            if r and r.name == "hacoo" and links.extract_id(r, final):
+                return final, origem
+        return None, "Esse link não leva a um produto da Hacoo."
+
+    async def hacoo_check(self, link: str = "") -> None:
+        """Verifica a sério, sem publicar nada, se a conta Hacoo está ligada e a converter."""
+        async def say(text: str, **kw) -> None:
+            await self.bot.send_message(self.owner, text, parse_mode="html", link_preview=False, **kw)
+
+        await say("🔎 A verificar a Hacoo (pode demorar até 1-2 minutos)…")
+        url, origem = await self._hacoo_test_product((link or "").strip())
+        if not url:
+            await say("⚠️ " + html.escape(origem))
+            return
+        try:
+            self.hacoo.vault.load(self.owner)
+            sessao = "presente"
+        except HacooError:
+            sessao = "ausente ou expirada"
+        auto = "ligada" if self.hacoo.auto_login else "desligada"
+        gerador = "" if self.s("hacoo_generator", False) else (
+            "\nℹ️ O modo gerador está <b>desligado</b>: o bot não converte pela Hacoo até fazeres /hacoo_login."
+        )
+        t0 = time.monotonic()
+        self.hacoo.last_run = None
+        try:
+            link_ok = await self.hacoo.convert(self.owner, url)
+        except HacooError as exc:
+            await say(
+                "❌ <b>Hacoo com problema</b>\n"
+                f"Motivo: {html.escape(str(exc))}\n"
+                f"Sessão local antes do teste: {sessao} · Autenticação automática: {auto}\n"
+                "Nada foi publicado." + gerador
+            )
+            return
+        except Exception as exc:  # nunca mostrar a mensagem original (pode ter dados)
+            log.warning("Verificação Hacoo: erro inesperado (%s)", type(exc).__name__)
+            await say("❌ <b>Hacoo com problema</b>\nErro inesperado ao converter. Vê o log (botctl logs).\nNada foi publicado.")
+            return
+        run = self.hacoo.last_run or {}
+        extra = []
+        if run.get("relogged"):
+            extra.append("autenticou-se sozinho nesta verificação (a sessão estava ausente ou tinha expirado)")
+        if run.get("retries"):
+            extra.append(f"repetiu {run['retries']} vez(es) por uma falha temporária")
+        pid = links.extract_id(links.match_rule(url, links.load_rules(self.cfg.rules_path)), url) or "?"
+        await say(
+            "✅ <b>Hacoo OK: sessão válida e a converter</b>\n"
+            f"Produto de teste: {html.escape(origem)} (id {html.escape(str(pid))})\n"
+            f"Tempo: {time.monotonic() - t0:.1f}s"
+            + ("\nNota: " + "; ".join(extra) if extra else "")
+            + f"\nSessão local antes do teste: {sessao} · Autenticação automática: {auto}\n"
+            f"Link gerado: {html.escape(link_ok)}\nNada foi publicado." + gerador
+        )
+
     async def cmd_hacoo_sair(self, event, arg):
         await self.hacoo.logout()
         await event.respond("Sessão Hacoo apagada deste servidor. O modo gerador mantém-se: não converto até novo /hacoo_login. Para revogar outras sessões, usa o site Hacoo.")
@@ -708,6 +800,7 @@ class App:
         return [
             [Button.inline("🔄 Forçar: mostrar as 5 últimas", "f:5")],
             [Button.inline("🧪 Forçar sem link (teste)", "g:5")],
+            [Button.inline("🔎 Verificar Hacoo", "h:1")],
         ]
 
     async def cmd_start(self, event, arg):
@@ -1160,6 +1253,9 @@ class App:
             elif kind == "f":
                 await event.answer("A obter as últimas ofertas…")
                 await self.force_recent(int(val) if val.isdigit() else 5)
+            elif kind == "h":
+                await event.answer("A verificar a Hacoo…")
+                await self.hacoo_check()
             elif kind == "g":
                 await event.answer("A obter as últimas ofertas (sem link)…")
                 await self.force_recent(int(val) if val.isdigit() else 5, nolink=True)
