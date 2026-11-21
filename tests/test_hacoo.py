@@ -160,6 +160,7 @@ def test_conversion_pipeline_no_fallback_and_dedup(tmp_path, monkeypatch):
         assert app.store.count_pending() == 0  # Existing template is never used.
         app.hacoo.convert.side_effect = None
         app.hacoo.convert.return_value = GENERATED
+        app.hacoo_down_until = 0.0  # fim da janela de espera após a falha
         await asyncio.gather(app.process(job), app.process(job))
         assert app.store.count_pending() == 1
         assert app.hacoo.convert.await_count == 2  # Failure + one successful conversion.

@@ -54,6 +54,10 @@ Se não conseguir converter (loja desconhecida, formato mudou, falta o `/linkmod
 
 Lojas: vêm definidas em `data/rules.json` (a Hacoo vem de origem). Para outra loja, acrescenta uma regra com `host_re`, `id_re` (o grupo 1 é o ID) e `template`, e envia `/recarregar`.
 
+### Se o Hacoo falhar (espera automática)
+
+Se a conversão falhar (sessão expirada, login recusado, site em baixo), a oferta **não se perde nem é publicada sem o teu link**: fica em espera. No **próximo post novo** o bot autentica-se outra vez, converte e publica as que estavam em espera (primeiro as mais antigas), e avisa "✅ Hacoo recuperou". Em modo manual chegam-te para aprovar, como as outras. Depois de uma falha, os posts dos 2 minutos seguintes também esperam (não repete o login a cada post). Expiram ao fim de 6h. Comandos: `/espera` (ver), `/espera agora` (tentar já), `/espera limpar`. Palavra-passe errada ou captcha na Hacoo não se resolvem sozinhos: aí as ofertas ficam em espera até corrigires.
+
 ## Modo account
 
 Define `MODE=account` no `.env`, corre `botctl login` e, no pedido, escreve o **número de telemóvel** (nunca o token do BotFather: um bot não lê grupos). Depois usa `/escolher` e `/destino` (botões). Emojis premium: `/modelo` e envia a mensagem com os emojis.

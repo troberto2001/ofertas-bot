@@ -39,6 +39,8 @@ from .watchdog import Watchdog
 
 log = logging.getLogger("ofertas")
 
+HELD_MAX_AGE_SEC = 6 * 3600   # ofertas em espera expiram (já podem estar desatualizadas)
+HACOO_DOWN_SEC = 120          # após uma falha, os posts seguintes esperam em vez de repetir logo o login
 NOTICE_COOLDOWN_SEC = 1800  # o mesmo aviso de falha não se repete antes de 30 min
 
 AJUDA = """<b>Comandos</b>
@@ -59,6 +61,7 @@ AJUDA = """<b>Comandos</b>
 /hacoo_login – ligar o gerador Hacoo (email e palavra-passe, só em privado)
 /hacoo_estado · /hacoo_sair – ver sessão / apagar sessão local
 /hacoo_teste – VERIFICAR: a conta Hacoo está ligada e a converter? (não publica nada; aceita um link)
+/espera – ofertas à espera do Hacoo (repetem sozinhas no próximo post) · /espera agora · /espera limpar
 /hacoo_modelo – voltar explicitamente ao método /linkmodelo
 /cancelar – cancelar o pedido de credenciais
 /limite N – máximo de publicações por hora
@@ -143,6 +146,7 @@ class App:
         self.hacoo_timer = None
         self.command_lock = asyncio.Lock()
         self.process_lock = asyncio.Lock()
+        self.hacoo_down_until = 0.0
         self.publish_lock = asyncio.Lock()
 
     # ---------- definições ----------
@@ -305,6 +309,7 @@ class App:
         while True:
             job = await self.queue.get()
             try:
+                await self.drain_held()  # novo post: primeiro as que ficaram em espera
                 await self.process(job)
             except Exception as e:
                 log.exception("Erro a processar oferta")
@@ -342,6 +347,47 @@ class App:
             else:
                 log.info("Aviso repetido suprimido (máx. 1 igual a cada 30 min): %s", text[:80])
         return text
+
+    # ---------- ofertas em espera (Hacoo em baixo) ----------
+    def _hold(self, job: Job) -> None:
+        key = f"{job.chat_id}:{job.msg_id}"
+        payload = {
+            "chat_id": job.chat_id, "msg_id": job.msg_id, "photo_url": job.photo_url,
+            "web": job.web, "origin": job.origin,
+            "offer": {"title": job.offer.title, "price": job.offer.price, "urls": list(job.offer.urls)},
+        }
+        if self.store.hold(key, payload):
+            log.info("Oferta %s em espera (Hacoo indisponível)", key)
+
+    @staticmethod
+    def _job_from(payload: dict) -> Job:
+        o = payload["offer"]
+        return Job(payload["chat_id"], payload["msg_id"], Offer(o["title"], o["price"], list(o["urls"])),
+                   payload.get("photo_url"), bool(payload.get("web")), payload.get("origin", ""))
+
+    async def drain_held(self, manual: bool = False) -> int:
+        """Repete as ofertas em espera (mais antigas primeiro). Pára à primeira que voltar a falhar."""
+        if not manual and (self.paused or time.monotonic() < self.hacoo_down_until):
+            return 0
+        done = 0
+        if manual:
+            self.hacoo_down_until = 0.0
+        for row in self.store.held_all(HELD_MAX_AGE_SEC):
+            if self.paused:
+                break
+            self.store.held_delete(row["id"])
+            try:
+                await self.process(self._job_from(row["payload"]))
+            except Exception:
+                log.exception("Erro a retomar oferta em espera")
+                self._hold(self._job_from(row["payload"]))
+                break
+            if self.store.has_held_key(row["key"]):  # voltou a falhar: espera pelo próximo post
+                break
+            done += 1
+        if done:
+            await self.notify(f"✅ Hacoo recuperou: retomei {done} oferta(s) que estavam em espera.")
+        return done
 
     async def process(self, job: Job, force: bool = False, nolink: bool = False) -> str | None:
         async with self.process_lock:
@@ -386,10 +432,21 @@ class App:
         if not force and (self.store.was_posted(key, self.cfg.dedup_hours) or self.store.has_pending_key(key)):
             return None
         if rule.name == "hacoo" and self.s("hacoo_generator", False):
+            if not force and time.monotonic() < self.hacoo_down_until:
+                self._hold(job)  # acabou de falhar: não repete o login a cada post
+                return "Hacoo indisponível; oferta em espera."
             try:
                 link = await self.hacoo.convert(self.owner, final)
             except HacooError as exc:
-                return await self._fail(force, "⚠️ " + html.escape(str(exc)) + " Não publiquei.")
+                if force:
+                    return await self._fail(force, "⚠️ " + html.escape(str(exc)) + " Não publiquei.")
+                self.hacoo_down_until = time.monotonic() + HACOO_DOWN_SEC
+                self._hold(job)
+                return await self._fail(
+                    force,
+                    "⚠️ " + html.escape(str(exc)) + " Não publiquei: a oferta fica em espera e volto a tentar "
+                    "(com novo login) no próximo post.",
+                )
         else:
             link = links.build_link(rule, pid, final)
         if not link:
@@ -686,6 +743,23 @@ class App:
         finally:
             raw = email = None
 
+    async def cmd_espera(self, event, arg):
+        a = (arg or "").strip().lower()
+        if a == "limpar":
+            return await event.respond(f"🗑 Apaguei {self.store.held_clear()} oferta(s) em espera.")
+        if a == "agora":
+            n = await self.drain_held(manual=True)
+            left = self.store.held_count()
+            return await event.respond(f"Retomadas: {n} · ainda em espera: {left}" + (" (Hacoo ainda a falhar)" if left else ""))
+        rows = self.store.held_all(HELD_MAX_AGE_SEC)
+        if not rows:
+            return await event.respond("Nada em espera.")
+        lines = [f"⏳ <b>{len(rows)} em espera</b> (tento no próximo post; expiram em 6h):"]
+        for r in rows[:10]:
+            lines.append("• " + html.escape(r["payload"]["offer"]["title"][:60]))
+        lines.append("/espera agora · /espera limpar")
+        await event.respond("\n".join(lines), parse_mode="html")
+
     async def cmd_hacoo_estado(self, event, arg):
         mode = "gerador" if self.s("hacoo_generator", False) else "modelo"
         try:
@@ -821,7 +895,7 @@ class App:
             f"Código: <code>{html.escape(self.code or '(vazio)')}</code>",
             (f"Verificação do canal a cada ~{self.cfg.web_poll_sec}s" if self.web else f"Premium: {'sim' if self.premium else 'não'}"),
             f"Últimas 24h: {self.store.count_since(86400)} publicações · última: {ultima}",
-            f"Por aprovar: {self.store.count_pending()} · limite/hora: {self.max_per_hour}",
+            f"Por aprovar: {self.store.count_pending()} · em espera (Hacoo): {self.store.held_count()} · limite/hora: {self.max_per_hour}",
             "Hacoo: " + ("gerador (/hacoo_estado)" if self.s("hacoo_generator", False) else "modelo (/hacoo_login para ligar o gerador)"),
         ]
         if sem_modelo:

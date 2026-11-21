@@ -46,6 +46,12 @@ class Store:
                 ts INTEGER NOT NULL,
                 payload TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS held (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT NOT NULL UNIQUE,
+                ts INTEGER NOT NULL,
+                payload TEXT NOT NULL
+            );
             """
         )
         self.db.commit()
@@ -152,3 +158,36 @@ class Store:
 
     def count_pending(self) -> int:
         return self.db.execute("SELECT COUNT(*) AS c FROM pending").fetchone()["c"]
+
+    # ---- ofertas em espera (falha do Hacoo; repetidas no próximo post) ----
+    def hold(self, key: str, payload: dict) -> bool:
+        cur = self.db.execute(
+            "INSERT OR IGNORE INTO held(key, ts, payload) VALUES(?,?,?)",
+            (key, int(time.time()), json.dumps(payload)),
+        )
+        self.db.commit()
+        return cur.rowcount > 0
+
+    def held_all(self, max_age: int | None = None) -> list[dict]:
+        """Mais antigas primeiro. Com max_age, apaga antes as que já expiraram."""
+        if max_age is not None:
+            self.db.execute("DELETE FROM held WHERE ts < ?", (int(time.time()) - max_age,))
+            self.db.commit()
+        rows = self.db.execute("SELECT id, key, ts, payload FROM held ORDER BY id").fetchall()
+        return [{"id": r["id"], "key": r["key"], "ts": r["ts"], "payload": json.loads(r["payload"])} for r in rows]
+
+    def held_delete(self, held_id: int) -> None:
+        self.db.execute("DELETE FROM held WHERE id=?", (held_id,))
+        self.db.commit()
+
+    def has_held_key(self, key: str) -> bool:
+        return self.db.execute("SELECT 1 FROM held WHERE key=? LIMIT 1", (key,)).fetchone() is not None
+
+    def held_count(self) -> int:
+        return self.db.execute("SELECT COUNT(*) AS c FROM held").fetchone()["c"]
+
+    def held_clear(self) -> int:
+        n = self.held_count()
+        self.db.execute("DELETE FROM held")
+        self.db.commit()
+        return n
